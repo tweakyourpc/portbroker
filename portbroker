@@ -1,0 +1,2036 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import fcntl
+import html
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+from contextlib import contextmanager
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from typing import Any
+from urllib.error import URLError
+from urllib.request import urlopen
+
+PORTBROKER_VERSION = "1.1.0"
+DEFAULT_RANGE = "8700-8999"
+DEFAULT_HOST = "0.0.0.0"
+DEFAULT_PROTO = "tcp"
+SUPPORTED_PROTOS = {"tcp", "udp"}
+DEFAULT_SHELL_HELPER = Path.home() / ".config" / "portbroker" / "portbroker-shell.sh"
+DEFAULT_WEB_NAME = "portbroker-dashboard"
+DASHBOARD_REFRESH_MS = 5000
+WHOAMI_TIMEOUT_SECONDS = 0.35
+
+
+class PortBrokerError(Exception):
+    pass
+
+
+@dataclass
+class Listener:
+    proto: str
+    host: str
+    port: int
+    process_name: str | None
+    pid: int | None
+    raw: str
+    source: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "proto": self.proto,
+            "host": self.host,
+            "port": self.port,
+            "process": self.process_name,
+            "pid": self.pid,
+            "source": self.source,
+            "raw": self.raw,
+        }
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def config_dir() -> Path:
+    # Default registry path is ~/.config/portbroker/ports.json.
+    # Optional override exists for restricted environments.
+    explicit = os.environ.get("PORTBROKER_CONFIG_DIR")
+    if explicit:
+        return Path(explicit).expanduser()
+
+    xdg = os.environ.get("XDG_CONFIG_HOME")
+    if xdg:
+        return Path(xdg).expanduser() / "portbroker"
+
+    return Path.home() / ".config" / "portbroker"
+
+
+def registry_path() -> Path:
+    explicit = os.environ.get("PORTBROKER_REGISTRY")
+    if explicit:
+        return Path(explicit).expanduser()
+    return config_dir() / "ports.json"
+
+
+def lock_path() -> Path:
+    explicit = os.environ.get("PORTBROKER_LOCK")
+    if explicit:
+        return Path(explicit).expanduser()
+    return config_dir() / "ports.lock"
+
+
+def ensure_parent(path: Path) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise PortBrokerError(f"Cannot create directory '{path.parent}': {exc}") from exc
+
+
+@contextmanager
+def registry_lock() -> Any:
+    lock = lock_path()
+    ensure_parent(lock)
+    try:
+        with open(lock, "a+", encoding="utf-8") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    except OSError as exc:
+        raise PortBrokerError(f"Cannot open lock file '{lock}': {exc}") from exc
+
+
+def load_registry_raw() -> dict[str, Any]:
+    path = registry_path()
+    if not path.exists():
+        return {"version": 1, "entries": {}}
+
+    try:
+        content = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise PortBrokerError(f"Cannot read registry '{path}': {exc}") from exc
+
+    if not content.strip():
+        return {"version": 1, "entries": {}}
+
+    try:
+        data = json.loads(content)
+    except json.JSONDecodeError as exc:
+        raise PortBrokerError(
+            f"Registry '{path}' is not valid JSON ({exc.msg} at line {exc.lineno}, column {exc.colno})"
+        ) from exc
+
+    if not isinstance(data, dict):
+        raise PortBrokerError(f"Registry '{path}' must contain a JSON object")
+
+    if "entries" not in data:
+        # Backward-compatible read for a bare name->entry dictionary.
+        if all(isinstance(value, dict) for value in data.values()):
+            data = {"version": 1, "entries": data}
+        else:
+            raise PortBrokerError(f"Registry '{path}' is missing the 'entries' object")
+
+    entries = data.get("entries")
+    if not isinstance(entries, dict):
+        raise PortBrokerError(f"Registry '{path}' field 'entries' must be a JSON object")
+
+    return {"version": int(data.get("version", 1)), "entries": entries}
+
+
+def save_registry(entries: dict[str, dict[str, Any]]) -> None:
+    path = registry_path()
+    ensure_parent(path)
+    payload = {"version": 1, "entries": entries}
+
+    try:
+        fd, tmp_path = tempfile.mkstemp(prefix="ports.", suffix=".tmp", dir=str(path.parent))
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+        os.replace(tmp_path, path)
+    except OSError as exc:
+        raise PortBrokerError(f"Cannot write registry '{path}': {exc}") from exc
+
+
+def parse_port_range(value: str) -> tuple[int, int]:
+    match = re.fullmatch(r"(\d+)-(\d+)", value)
+    if not match:
+        raise PortBrokerError(f"Invalid range '{value}'. Expected format START-END (e.g., 8700-8999).")
+    start = int(match.group(1))
+    end = int(match.group(2))
+    if start < 1 or end > 65535 or start > end:
+        raise PortBrokerError(f"Invalid range '{value}'. Ports must be between 1 and 65535 and START <= END.")
+    return start, end
+
+
+def parse_port(value: Any) -> int:
+    try:
+        port = int(value)
+    except (TypeError, ValueError) as exc:
+        raise PortBrokerError(f"Invalid port '{value}'.") from exc
+    if port < 1 or port > 65535:
+        raise PortBrokerError(f"Invalid port '{value}'. Port must be between 1 and 65535.")
+    return port
+
+
+def flatten_meta(meta_values: list[list[str]] | None) -> list[str]:
+    if not meta_values:
+        return []
+    flattened: list[str] = []
+    for chunk in meta_values:
+        flattened.extend(chunk)
+    return flattened
+
+
+def parse_meta(meta_values: list[list[str]] | None) -> dict[str, str]:
+    result: dict[str, str] = {}
+    for item in flatten_meta(meta_values):
+        if "=" not in item:
+            raise PortBrokerError(f"Invalid --meta value '{item}'. Expected key=value.")
+        key, value = item.split("=", 1)
+        key = key.strip()
+        if not key:
+            raise PortBrokerError(f"Invalid --meta value '{item}'. Meta keys cannot be empty.")
+        result[key] = value
+    return result
+
+
+def parse_bool(value: Any, *, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        if value in {0, 1}:
+            return bool(value)
+        raise ValueError
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "y", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "n", "off", ""}:
+            return False
+        raise ValueError
+    raise ValueError
+
+
+def parse_endpoint(endpoint: str) -> tuple[str, int] | None:
+    value = endpoint.strip()
+    if not value:
+        return None
+
+    if value.startswith("["):
+        idx = value.rfind("]:")
+        if idx < 0:
+            return None
+        host = value[1:idx]
+        port_text = value[idx + 2 :]
+    else:
+        if ":" not in value:
+            return None
+        host, port_text = value.rsplit(":", 1)
+
+    if not port_text.isdigit():
+        return None
+
+    return host, int(port_text)
+
+
+def parse_ss_processes(field: str) -> list[tuple[str | None, int | None]]:
+    if not field:
+        return []
+
+    matches = list(re.finditer(r'"([^"]+)"(?:,pid=(\d+))?', field))
+    processes: list[tuple[str | None, int | None]] = []
+    for match in matches:
+        process = match.group(1)
+        pid_text = match.group(2)
+        pid = int(pid_text) if pid_text else None
+        processes.append((process, pid))
+    return processes
+
+
+def listeners_from_ss(proto: str) -> list[Listener]:
+    cmd = ["ss", "-H", "-l", "-n", "-p", "-t" if proto == "tcp" else "-u"]
+    proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+
+    if proc.returncode != 0 and not proc.stdout.strip():
+        detail = proc.stderr.strip() or f"exit code {proc.returncode}"
+        raise PortBrokerError(f"`ss` failed: {detail}")
+
+    listeners: list[Listener] = []
+    for raw_line in proc.stdout.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        parts = line.split(None, 5)
+        if len(parts) < 5:
+            continue
+        endpoint = parse_endpoint(parts[3])
+        if endpoint is None:
+            continue
+        host, port = endpoint
+        process_field = parts[5] if len(parts) >= 6 else ""
+        processes = parse_ss_processes(process_field)
+        if processes:
+            for process_name, pid in processes:
+                listeners.append(
+                    Listener(
+                        proto=proto,
+                        host=host,
+                        port=port,
+                        process_name=process_name,
+                        pid=pid,
+                        raw=line,
+                        source="ss",
+                    )
+                )
+        else:
+            listeners.append(
+                Listener(
+                    proto=proto,
+                    host=host,
+                    port=port,
+                    process_name=None,
+                    pid=None,
+                    raw=line,
+                    source="ss",
+                )
+            )
+    return listeners
+
+
+def listeners_from_lsof_tcp() -> list[Listener]:
+    cmd = ["lsof", "-nP", "-iTCP", "-sTCP:LISTEN"]
+    proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+
+    if proc.returncode not in {0, 1}:
+        detail = proc.stderr.strip() or f"exit code {proc.returncode}"
+        raise PortBrokerError(f"`lsof` failed: {detail}")
+
+    listeners: list[Listener] = []
+    lines = proc.stdout.splitlines()
+    for line in lines[1:]:
+        parts = line.split(None, 8)
+        if len(parts) < 9:
+            continue
+        command = parts[0]
+        pid_text = parts[1]
+        pid = int(pid_text) if pid_text.isdigit() else None
+        name_field = parts[8]
+        match = re.search(r"(.+):(\d+)\s+\(LISTEN\)$", name_field)
+        if not match:
+            continue
+        host = match.group(1)
+        if host.startswith("[") and host.endswith("]"):
+            host = host[1:-1]
+        port = int(match.group(2))
+        listeners.append(
+            Listener(
+                proto="tcp",
+                host=host,
+                port=port,
+                process_name=command,
+                pid=pid,
+                raw=line,
+                source="lsof",
+            )
+        )
+    return listeners
+
+
+def listeners_for_proto(proto: str) -> list[Listener]:
+    if proto not in SUPPORTED_PROTOS:
+        raise PortBrokerError(f"Unsupported protocol '{proto}'. Expected one of: {', '.join(sorted(SUPPORTED_PROTOS))}.")
+
+    ss_path = shutil.which("ss")
+    if ss_path:
+        try:
+            return listeners_from_ss(proto)
+        except PortBrokerError:
+            if proto == "tcp" and shutil.which("lsof"):
+                return listeners_from_lsof_tcp()
+            raise
+
+    if proto == "tcp" and shutil.which("lsof"):
+        return listeners_from_lsof_tcp()
+
+    if proto == "tcp":
+        raise PortBrokerError(
+            "Cannot inspect port usage: `ss` is unavailable and fallback `lsof -iTCP -sTCP:LISTEN` is unavailable."
+        )
+    raise PortBrokerError("Cannot inspect UDP listeners without `ss`.")
+
+
+def listeners_by_key(entries: dict[str, dict[str, Any]]) -> dict[tuple[str, int], list[Listener]]:
+    mapping: dict[tuple[str, int], list[Listener]] = {}
+    protos = sorted({entry["proto"] for entry in entries.values() if "proto" in entry})
+    for proto in protos:
+        for listener in listeners_for_proto(proto):
+            mapping.setdefault((listener.proto, listener.port), []).append(listener)
+    return mapping
+
+
+def normalize_entries(raw_entries: Any) -> tuple[dict[str, dict[str, Any]], list[dict[str, str]]]:
+    issues: list[dict[str, str]] = []
+    normalized: dict[str, dict[str, Any]] = {}
+
+    if not isinstance(raw_entries, dict):
+        issues.append({"level": "error", "name": "-", "message": "Registry 'entries' is not an object."})
+        return normalized, issues
+
+    seen_proto_port: dict[tuple[str, int], str] = {}
+
+    for key, value in raw_entries.items():
+        name = str(key)
+        if not isinstance(value, dict):
+            issues.append({"level": "error", "name": name, "message": "Entry must be an object."})
+            continue
+
+        entry_name = str(value.get("name", key))
+        if entry_name != name:
+            issues.append(
+                {
+                    "level": "warning",
+                    "name": name,
+                    "message": f"Entry name field '{entry_name}' does not match key '{name}'.",
+                }
+            )
+
+        try:
+            port = parse_port(value.get("port"))
+        except PortBrokerError as exc:
+            issues.append({"level": "error", "name": name, "message": str(exc)})
+            continue
+
+        host = str(value.get("host", DEFAULT_HOST))
+        proto = str(value.get("proto", DEFAULT_PROTO)).lower()
+        if proto not in SUPPORTED_PROTOS:
+            issues.append(
+                {
+                    "level": "error",
+                    "name": name,
+                    "message": f"Unsupported proto '{proto}'. Expected tcp or udp.",
+                }
+            )
+            continue
+
+        created_at = str(value.get("createdAt", ""))
+        updated_at = str(value.get("updatedAt", ""))
+        cwd = str(value.get("cwd", ""))
+        cmd = value.get("cmd", "")
+        if cmd is None:
+            cmd = ""
+        if not isinstance(cmd, str):
+            cmd = str(cmd)
+        meta = value.get("meta", {})
+        if not isinstance(meta, dict):
+            issues.append({"level": "warning", "name": name, "message": "Meta is not an object; resetting to {}."})
+            meta = {}
+        try:
+            persistent = parse_bool(value.get("persistent", False), default=False)
+        except ValueError:
+            issues.append(
+                {"level": "warning", "name": name, "message": "Persistent is invalid; resetting to false."}
+            )
+            persistent = False
+
+        dedupe_key = (proto, port)
+        prior = seen_proto_port.get(dedupe_key)
+        if prior and prior != name:
+            issues.append(
+                {
+                    "level": "error",
+                    "name": name,
+                    "message": f"Duplicate reservation for {proto}/{port}. Already reserved by '{prior}'.",
+                }
+            )
+            continue
+        seen_proto_port[dedupe_key] = name
+
+        normalized[name] = {
+            "name": name,
+            "port": port,
+            "host": host,
+            "proto": proto,
+            "createdAt": created_at,
+            "updatedAt": updated_at,
+            "cwd": cwd,
+            "cmd": cmd,
+            "meta": meta,
+            "persistent": persistent,
+        }
+
+    return normalized, issues
+
+
+def load_entries(strict: bool = True) -> dict[str, dict[str, Any]]:
+    raw = load_registry_raw()
+    normalized, issues = normalize_entries(raw.get("entries", {}))
+    if strict and any(issue["level"] == "error" for issue in issues):
+        first = next(issue for issue in issues if issue["level"] == "error")
+        raise PortBrokerError(
+            f"Registry has invalid entries ({first['name']}: {first['message']}). "
+            "Run `portbroker doctor` for details."
+        )
+    return normalized
+
+
+def emit_port(name: str, port: int, as_json: bool) -> None:
+    if as_json:
+        print(json.dumps({"name": name, "port": port}, sort_keys=True))
+    else:
+        print(port)
+
+
+def merge_meta(current: dict[str, str], incoming: dict[str, str]) -> dict[str, str]:
+    merged = dict(current)
+    merged.update(incoming)
+    return merged
+
+
+def port_env_expr(name: str) -> str:
+    quoted = shlex.quote(name)
+    return (
+        f"PORT=$(portbroker get --name {quoted} 2>/dev/null "
+        f"|| portbroker alloc --name {quoted} --persistent)"
+    )
+
+
+def shell_helper_content() -> str:
+    return """#!/usr/bin/env bash
+
+# Source this file from bash or zsh to use the `dev` helper.
+# Example:
+#   source ~/.config/portbroker/portbroker-shell.sh
+#   dev my-app
+_portbroker_bin() {
+  if [ -n "${PORTBROKER_BIN:-}" ]; then
+    printf '%s\\n' "$PORTBROKER_BIN"
+    return 0
+  fi
+
+  if command -v portbroker >/dev/null 2>&1; then
+    printf '%s\\n' "portbroker"
+    return 0
+  fi
+
+  echo "portbroker not found in PATH." >&2
+  return 127
+}
+
+dev() {
+  if [ "$#" -ne 1 ]; then
+    echo "usage: dev <app-name>" >&2
+    return 2
+  fi
+
+  local app port broker
+  app="$1"
+  if ! broker="$(_portbroker_bin)"; then
+    return $?
+  fi
+
+  # Keep disposable reservations tidy without blocking startup.
+  ("$broker" cleanup >/dev/null 2>&1 &) >/dev/null 2>&1
+
+  if ! port="$("$broker" alloc --name "$app" --persistent)"; then
+    return $?
+  fi
+
+  export PORT="$port"
+  npm start
+}
+"""
+
+
+def strip_port_env_prefix(cmd: str) -> tuple[str, bool]:
+    match = re.match(
+        r"^PORT=\$\([^)]*portbroker get --name[^)]*portbroker alloc --name[^)]*\)\s+(.*)$",
+        cmd.strip(),
+        flags=re.DOTALL,
+    )
+    if not match:
+        return cmd, False
+    return match.group(1).strip(), True
+
+
+def expected_process_name(cmd: str) -> str | None:
+    if not cmd.strip():
+        return None
+    try:
+        parts = shlex.split(cmd)
+    except ValueError:
+        parts = cmd.strip().split()
+    if not parts:
+        return None
+    return Path(parts[0]).name.lower()
+
+
+def listener_owner_summary(listeners: list[Listener]) -> str:
+    details = ", ".join(
+        sorted(
+            {
+                f"{listener.process_name or 'unknown'}"
+                + (f"(pid={listener.pid})" if listener.pid is not None else "")
+                for listener in listeners
+            }
+        )
+    )
+    return details or "another process"
+
+
+def safe_listeners_by_key(entries: dict[str, dict[str, Any]]) -> tuple[dict[tuple[str, int], list[Listener]], str | None]:
+    if not entries:
+        return {}, None
+    try:
+        return listeners_by_key(entries), None
+    except PortBrokerError as exc:
+        return {}, str(exc)
+
+
+def build_dashboard_snapshot(service_name: str, version: str) -> dict[str, Any]:
+    with registry_lock():
+        entries = load_entries(strict=True)
+        listener_map, listener_error = safe_listeners_by_key(entries)
+
+    rows: list[dict[str, Any]] = []
+    active_count = 0
+    persistent_count = 0
+    inactive_count = 0
+    unknown_count = 0
+
+    for name in sorted(entries):
+        entry = entries[name]
+        listeners = listener_map.get((entry["proto"], entry["port"]), [])
+        if listener_error:
+            status = "unknown"
+            active: bool | None = None
+            unknown_count += 1
+        elif listeners:
+            status = "active"
+            active = True
+            active_count += 1
+        else:
+            status = "reserved"
+            active = False
+            inactive_count += 1
+
+        if entry.get("persistent", False):
+            persistent_count += 1
+
+        last_seen_pid = next((listener.pid for listener in listeners if listener.pid is not None), None)
+        rows.append(
+            {
+                "name": name,
+                "port": entry["port"],
+                "host": entry["host"],
+                "proto": entry["proto"],
+                "status": status,
+                "active": active,
+                "persistent": bool(entry.get("persistent", False)),
+                "cwd": entry.get("cwd", ""),
+                "cmd": entry.get("cmd", ""),
+                "createdAt": entry.get("createdAt", ""),
+                "updatedAt": entry.get("updatedAt", ""),
+                "lastSeenPid": last_seen_pid,
+                "listenerCount": len(listeners),
+                "listeners": sorted(
+                    {
+                        f"{listener.process_name or 'unknown'}"
+                        + (f"(pid={listener.pid})" if listener.pid is not None else "")
+                        for listener in listeners
+                    }
+                ),
+                "meta": entry.get("meta", {}),
+            }
+        )
+
+    return {
+        "service": service_name,
+        "version": version,
+        "checkedAt": now_iso(),
+        "registryPath": str(registry_path()),
+        "listenerError": listener_error,
+        "summary": {
+            "total": len(rows),
+            "active": active_count,
+            "reserved": inactive_count,
+            "persistent": persistent_count,
+            "unknown": unknown_count,
+        },
+        "ports": rows,
+    }
+
+
+def whoami_probe_url(host: str, port: int) -> str:
+    probe_host = host or "127.0.0.1"
+    if probe_host in {"0.0.0.0", "::", "*"}:
+        probe_host = "127.0.0.1"
+    if ":" in probe_host and not probe_host.startswith("["):
+        probe_host = f"[{probe_host}]"
+    return f"http://{probe_host}:{port}/whoami"
+
+
+def fetch_dashboard_whoami(host: str, port: int) -> dict[str, Any] | None:
+    url = whoami_probe_url(host, port)
+    try:
+        with urlopen(url, timeout=WHOAMI_TIMEOUT_SECONDS) as response:
+            if response.status != 200:
+                return None
+            data = json.loads(response.read().decode("utf-8"))
+    except (OSError, TimeoutError, URLError, ValueError, json.JSONDecodeError):
+        return None
+
+    if not isinstance(data, dict):
+        return None
+    return data
+
+
+def find_free_port(
+    entries: dict[str, dict[str, Any]],
+    proto: str,
+    port_range: tuple[int, int],
+    *,
+    exclude_names: set[str] | None = None,
+) -> int:
+    start, end = port_range
+    excluded = exclude_names or set()
+    reserved = {
+        entry["port"]
+        for name, entry in entries.items()
+        if name not in excluded and entry["proto"] == proto
+    }
+    listening = {listener.port for listener in listeners_for_proto(proto)}
+    for candidate in range(start, end + 1):
+        if candidate in reserved or candidate in listening:
+            continue
+        return candidate
+    raise PortBrokerError(f"No free {proto.upper()} ports found in range {start}-{end}.")
+
+
+def render_web_command(name: str, host: str, port: int | None, range_value: str, persistent: bool) -> str:
+    parts = ["portbroker", "web", "--name", name]
+    if host != DEFAULT_HOST:
+        parts.extend(["--host", host])
+    if port is not None:
+        parts.extend(["--port", str(port)])
+    if range_value != DEFAULT_RANGE:
+        parts.extend(["--range", range_value])
+    if persistent:
+        parts.append("--persistent")
+    return shlex.join(parts)
+
+
+def reserve_web_port(
+    *,
+    name: str,
+    host: str,
+    requested_port: int | None,
+    range_value: str,
+    persistent: bool,
+) -> int:
+    port_range = parse_port_range(range_value)
+    cmd = render_web_command(name, host, requested_port, range_value, persistent)
+
+    with registry_lock():
+        entries = load_entries(strict=True)
+        existing = entries.get(name)
+        now = now_iso()
+
+        if requested_port is not None:
+            for other_name, other in entries.items():
+                if other_name == name:
+                    continue
+                if other["proto"] == "tcp" and other["port"] == requested_port:
+                    raise PortBrokerError(f"Port {requested_port}/tcp is already reserved by '{other_name}'.")
+
+            listeners = [listener for listener in listeners_for_proto("tcp") if listener.port == requested_port]
+            if listeners:
+                whoami = fetch_dashboard_whoami(host, requested_port)
+                if whoami and whoami.get("service") == name:
+                    raise PortBrokerError(f"Dashboard '{name}' is already running on {host}:{requested_port}.")
+                raise PortBrokerError(
+                    f"Port {requested_port}/tcp is already in use by {listener_owner_summary(listeners)}."
+                )
+
+            created_at = existing["createdAt"] if existing else now
+            meta = dict(existing.get("meta", {})) if existing else {}
+            entries[name] = {
+                "name": name,
+                "port": requested_port,
+                "host": host,
+                "proto": "tcp",
+                "createdAt": created_at,
+                "updatedAt": now,
+                "cwd": os.getcwd(),
+                "cmd": cmd,
+                "meta": meta,
+                "persistent": bool(persistent) or bool(existing and existing.get("persistent", False)),
+            }
+            save_registry(entries)
+            return requested_port
+
+        if existing:
+            current_port = existing["port"]
+            listeners = [listener for listener in listeners_for_proto("tcp") if listener.port == current_port]
+            if listeners:
+                whoami = fetch_dashboard_whoami(existing.get("host", host), current_port)
+                if whoami and whoami.get("service") == name:
+                    raise PortBrokerError(
+                        f"Dashboard '{name}' is already running on {existing.get('host', host)}:{current_port}."
+                    )
+                selected_port = find_free_port(entries, "tcp", port_range, exclude_names={name})
+            else:
+                selected_port = current_port
+
+            entries[name] = {
+                "name": name,
+                "port": selected_port,
+                "host": host,
+                "proto": "tcp",
+                "createdAt": existing.get("createdAt", now),
+                "updatedAt": now,
+                "cwd": os.getcwd(),
+                "cmd": cmd,
+                "meta": dict(existing.get("meta", {})),
+                "persistent": bool(persistent) or bool(existing.get("persistent", False)),
+            }
+            save_registry(entries)
+            return selected_port
+
+        selected_port = find_free_port(entries, "tcp", port_range)
+        entries[name] = {
+            "name": name,
+            "port": selected_port,
+            "host": host,
+            "proto": "tcp",
+            "createdAt": now,
+            "updatedAt": now,
+            "cwd": os.getcwd(),
+            "cmd": cmd,
+            "meta": {},
+            "persistent": bool(persistent),
+        }
+        save_registry(entries)
+        return selected_port
+
+
+def dashboard_open_url(host: str, port: int) -> str:
+    if host in {"0.0.0.0", "::"}:
+        return f"http://<this-host>:{port}"
+    if ":" in host and not host.startswith("["):
+        return f"http://[{host}]:{port}"
+    return f"http://{host}:{port}"
+
+
+def render_dashboard_html(service_name: str, version: str) -> str:
+    title = html.escape(service_name)
+    version_label = html.escape(version)
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{title}</title>
+<style>
+:root {{
+  color-scheme: light;
+  --bg: #f4efe6;
+  --panel: rgba(255, 255, 255, 0.88);
+  --ink: #1f2933;
+  --muted: #5b6673;
+  --line: rgba(31, 41, 51, 0.12);
+  --accent: #0f766e;
+  --idle: #475569;
+  --warn: #b45309;
+  --shadow: 0 20px 48px rgba(31, 41, 51, 0.08);
+  font-family: "IBM Plex Sans", "Segoe UI Variable", "Trebuchet MS", sans-serif;
+}}
+* {{
+  box-sizing: border-box;
+}}
+body {{
+  margin: 0;
+  min-height: 100vh;
+  background:
+    radial-gradient(circle at top right, rgba(15, 118, 110, 0.14), transparent 40%),
+    linear-gradient(145deg, #f8f4ec, #eef5f6);
+  color: var(--ink);
+}}
+.shell {{
+  max-width: 1180px;
+  margin: 0 auto;
+  padding: 2.5rem 1.2rem 3rem;
+}}
+.hero {{
+  margin-bottom: 1.5rem;
+}}
+.eyebrow {{
+  margin: 0;
+  font-size: 0.85rem;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--accent);
+}}
+h1 {{
+  margin: 0.35rem 0 0.5rem;
+  font-size: clamp(2rem, 4vw, 3.3rem);
+  line-height: 1.05;
+}}
+.lede {{
+  margin: 0;
+  max-width: 44rem;
+  color: var(--muted);
+}}
+.grid {{
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 0.9rem;
+  margin: 1.4rem 0 1rem;
+}}
+.card {{
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 18px;
+  padding: 1rem 1.1rem;
+  box-shadow: var(--shadow);
+}}
+.card span {{
+  display: block;
+  font-size: 0.8rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+}}
+.card strong {{
+  display: block;
+  margin-top: 0.45rem;
+  font-size: 1.7rem;
+}}
+.hint {{
+  margin: 0 0 1rem;
+  color: var(--muted);
+}}
+.banner {{
+  margin: 0 0 1rem;
+  padding: 0.8rem 1rem;
+  border-radius: 14px;
+  border: 1px solid rgba(180, 83, 9, 0.18);
+  background: rgba(180, 83, 9, 0.08);
+  color: var(--warn);
+}}
+.table-wrap {{
+  overflow-x: auto;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 20px;
+  box-shadow: var(--shadow);
+}}
+table {{
+  width: 100%;
+  border-collapse: collapse;
+}}
+th, td {{
+  padding: 0.9rem 1rem;
+  text-align: left;
+  border-bottom: 1px solid var(--line);
+  vertical-align: top;
+}}
+th {{
+  font-size: 0.8rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+}}
+tbody tr:last-child td {{
+  border-bottom: 0;
+}}
+.mono {{
+  font-family: "IBM Plex Mono", "Cascadia Mono", "SFMono-Regular", monospace;
+}}
+.process {{
+  min-width: 14rem;
+}}
+.site-name {{
+  min-width: 14rem;
+}}
+.site-link {{
+  color: var(--accent);
+  text-decoration: none;
+  font-weight: 700;
+}}
+.site-link:hover {{
+  text-decoration: underline;
+}}
+.site-fallback {{
+  margin-top: 0.3rem;
+  font-size: 0.78rem;
+  color: var(--muted);
+}}
+.site-fallback a {{
+  color: inherit;
+}}
+.pill {{
+  display: inline-flex;
+  align-items: center;
+  border-radius: 999px;
+  padding: 0.2rem 0.65rem;
+  font-size: 0.78rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}}
+.pill.active {{
+  background: rgba(15, 118, 110, 0.12);
+  color: var(--accent);
+}}
+.pill.reserved {{
+  background: rgba(71, 85, 105, 0.12);
+  color: var(--idle);
+}}
+.pill.unknown {{
+  background: rgba(180, 83, 9, 0.12);
+  color: var(--warn);
+}}
+.footer {{
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.9rem;
+  margin-top: 1rem;
+  color: var(--muted);
+  font-size: 0.9rem;
+}}
+code {{
+  font-family: "IBM Plex Mono", "Cascadia Mono", "SFMono-Regular", monospace;
+}}
+@media (max-width: 720px) {{
+  .shell {{
+    padding: 1.3rem 0.75rem 2rem;
+  }}
+  th, td {{
+    padding: 0.75rem;
+  }}
+}}
+</style>
+</head>
+<body>
+<main class="shell">
+  <section class="hero">
+    <p class="eyebrow">Port Broker Dashboard</p>
+    <h1>{title}</h1>
+    <p class="lede">Live reservation and listener state from the local portbroker registry.</p>
+  </section>
+  <section class="grid">
+    <article class="card"><span>Total</span><strong id="totalCount">-</strong></article>
+    <article class="card"><span>Active</span><strong id="activeCount">-</strong></article>
+    <article class="card"><span>Reserved</span><strong id="reservedCount">-</strong></article>
+    <article class="card"><span>Persistent</span><strong id="persistentCount">-</strong></article>
+  </section>
+  <p class="hint" id="checkedAt">Waiting for first refresh...</p>
+  <p class="banner" id="warning" hidden></p>
+  <section class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>Name</th>
+          <th>Port</th>
+          <th>Host</th>
+          <th>Proto</th>
+          <th>Status</th>
+          <th>Process</th>
+          <th>Persistent</th>
+          <th>Updated</th>
+        </tr>
+      </thead>
+      <tbody id="rows">
+        <tr><td colspan="8">Loading...</td></tr>
+      </tbody>
+    </table>
+  </section>
+  <footer class="footer">
+    <span>v{version_label}</span>
+    <span><code>/api/ports</code></span>
+    <span><code>/whoami</code></span>
+  </footer>
+</main>
+<script>
+const refreshMs = {DASHBOARD_REFRESH_MS};
+// Safe default for local access; browser hostname can override this automatically.
+const fallbackLanHost = '127.0.0.1';
+const rowsNode = document.getElementById('rows');
+const warningNode = document.getElementById('warning');
+
+function setText(id, value) {{
+  document.getElementById(id).textContent = String(value);
+}}
+
+function appendCell(row, value, className) {{
+  const cell = document.createElement('td');
+  if (className) {{
+    cell.className = className;
+  }}
+  cell.textContent = value;
+  row.appendChild(cell);
+}}
+
+function isWildcardOrLoopback(host) {{
+  const value = String(host || '').trim().toLowerCase();
+  return (
+    !value ||
+    value === '0.0.0.0' ||
+    value === '::' ||
+    value === '*' ||
+    value === 'localhost' ||
+    value === '127.0.0.1' ||
+    value === '::1'
+  );
+}}
+
+function normalizedHost(host) {{
+  const browserHost = String(window.location.hostname || '').trim();
+  if (isWildcardOrLoopback(host)) {{
+    return browserHost || fallbackLanHost;
+  }}
+  return String(host || '').trim();
+}}
+
+function httpUrl(host, port) {{
+  const formattedHost = host.includes(':') && !host.startsWith('[') && !host.endsWith(']')
+    ? `[${{host}}]`
+    : host;
+  return `http://${{formattedHost}}:${{port}}`;
+}}
+
+function appendNameCell(row, item) {{
+  const cell = document.createElement('td');
+  cell.className = 'site-name';
+  const name = item.name || '';
+  const port = Number(item.port);
+  const isTcp = String(item.proto || '').toLowerCase() === 'tcp';
+  if (!isTcp || !Number.isInteger(port) || port < 1 || port > 65535) {{
+    cell.textContent = name;
+    row.appendChild(cell);
+    return;
+  }}
+
+  const primaryHost = normalizedHost(item.host);
+  const primaryLink = document.createElement('a');
+  primaryLink.className = 'site-link';
+  primaryLink.href = httpUrl(primaryHost, port);
+  primaryLink.textContent = name || `${{primaryHost}}:${{port}}`;
+  cell.appendChild(primaryLink);
+
+  if (primaryHost !== fallbackLanHost) {{
+    const fallback = document.createElement('div');
+    fallback.className = 'site-fallback';
+    fallback.appendChild(document.createTextNode('fallback '));
+    const fallbackLink = document.createElement('a');
+    fallbackLink.href = httpUrl(fallbackLanHost, port);
+    fallbackLink.textContent = `${{fallbackLanHost}}:${{port}}`;
+    fallback.appendChild(fallbackLink);
+    cell.appendChild(fallback);
+  }}
+
+  row.appendChild(cell);
+}}
+
+function appendStatus(row, status) {{
+  const cell = document.createElement('td');
+  const pill = document.createElement('span');
+  pill.className = `pill ${{status}}`;
+  if (status === 'active') {{
+    pill.textContent = 'Active';
+  }} else if (status === 'reserved') {{
+    pill.textContent = 'Reserved';
+  }} else {{
+    pill.textContent = 'Unknown';
+  }}
+  cell.appendChild(pill);
+  row.appendChild(cell);
+}}
+
+function renderRows(items) {{
+  rowsNode.textContent = '';
+  if (!items.length) {{
+    const row = document.createElement('tr');
+    const cell = document.createElement('td');
+    cell.colSpan = 8;
+    cell.textContent = 'No reservations in the registry.';
+    row.appendChild(cell);
+    rowsNode.appendChild(row);
+    return;
+  }}
+
+  for (const item of items) {{
+    const row = document.createElement('tr');
+    const tooltip = [];
+    if (item.cwd) {{
+      tooltip.push(`cwd: ${{item.cwd}}`);
+    }}
+    if (item.cmd) {{
+      tooltip.push(`cmd: ${{item.cmd}}`);
+    }}
+    const metaEntries = Object.entries(item.meta || {{}});
+    if (metaEntries.length) {{
+      tooltip.push('meta: ' + metaEntries.map(([key, value]) => key + '=' + value).join(', '));
+    }}
+    if (tooltip.length) {{
+      row.title = tooltip.join('\\n');
+    }}
+
+    appendNameCell(row, item);
+    appendCell(row, String(item.port ?? ''), 'mono');
+    appendCell(row, normalizedHost(item.host), 'mono');
+    appendCell(row, item.proto || '', 'mono');
+    appendStatus(row, item.status || 'unknown');
+
+    const processes = Array.isArray(item.listeners) && item.listeners.length ? item.listeners.join(', ') : 'idle';
+    appendCell(row, processes, 'mono process');
+    appendCell(row, item.persistent ? 'yes' : 'no');
+    appendCell(row, item.updatedAt || item.createdAt || '', 'mono');
+    rowsNode.appendChild(row);
+  }}
+}}
+
+async function refresh() {{
+  try {{
+    const response = await fetch('/api/ports', {{ cache: 'no-store' }});
+    const data = await response.json();
+    if (!response.ok) {{
+      throw new Error(data.error || `HTTP ${{response.status}}`);
+    }}
+
+    setText('totalCount', data.summary?.total ?? 0);
+    setText('activeCount', data.summary?.active ?? 0);
+    setText('reservedCount', data.summary?.reserved ?? 0);
+    setText('persistentCount', data.summary?.persistent ?? 0);
+
+    const checkedAt = data.checkedAt ? `Last checked ${{data.checkedAt}}` : 'Waiting for first refresh...';
+    const registry = data.registryPath ? ` • Registry ${{data.registryPath}}` : '';
+    setText('checkedAt', `${{checkedAt}}${{registry}}`);
+
+    warningNode.hidden = !data.listenerError;
+    warningNode.textContent = data.listenerError || '';
+    renderRows(data.ports || []);
+  }} catch (error) {{
+    warningNode.hidden = false;
+    warningNode.textContent = `Refresh failed: ${{error.message}}`;
+  }}
+}}
+
+refresh();
+window.setInterval(refresh, refreshMs);
+</script>
+</body>
+</html>
+"""
+
+
+class PortBrokerDashboardHandler(BaseHTTPRequestHandler):
+    server_version = f"portbroker/{PORTBROKER_VERSION}"
+    sys_version = ""
+
+    def log_message(self, format: str, *args: Any) -> None:
+        if getattr(self.server, "access_log", False):
+            super().log_message(format, *args)
+
+    def send_json(self, payload: dict[str, Any], status: int = 200) -> None:
+        body = json.dumps(payload, indent=2, sort_keys=True).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def send_html(self, body: str) -> None:
+        encoded = body.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(encoded)))
+        self.end_headers()
+        self.wfile.write(encoded)
+
+    def do_GET(self) -> None:
+        path = self.path.split("?", 1)[0]
+        if path == "/":
+            self.send_html(render_dashboard_html(self.server.dashboard_name, self.server.dashboard_version))
+            return
+
+        if path == "/api/ports":
+            try:
+                snapshot = build_dashboard_snapshot(self.server.dashboard_name, self.server.dashboard_version)
+            except PortBrokerError as exc:
+                self.send_json({"error": str(exc)}, status=500)
+                return
+            self.send_json(snapshot)
+            return
+
+        if path == "/whoami":
+            self.send_json(
+                {
+                    "service": self.server.dashboard_name,
+                    "version": self.server.dashboard_version,
+                    "pid": os.getpid(),
+                    "startedAt": self.server.started_at,
+                    "host": self.server.bind_host,
+                    "port": self.server.bind_port,
+                }
+            )
+            return
+
+        if path == "/favicon.ico":
+            self.send_response(204)
+            self.end_headers()
+            return
+
+        self.send_json({"error": f"No route for {path}"}, status=404)
+
+
+class PortBrokerDashboardServer(ThreadingHTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+    def __init__(self, host: str, port: int, dashboard_name: str, access_log: bool) -> None:
+        super().__init__((host, port), PortBrokerDashboardHandler)
+        self.dashboard_name = dashboard_name
+        self.dashboard_version = PORTBROKER_VERSION
+        self.started_at = now_iso()
+        self.bind_host = host
+        self.bind_port = port
+        self.access_log = access_log
+
+
+def find_stale_names(entries: dict[str, dict[str, Any]]) -> list[str]:
+    if not entries:
+        return []
+
+    listener_map = listeners_by_key(entries)
+    stale: list[str] = []
+    for name, entry in entries.items():
+        if entry.get("persistent", False):
+            continue
+        listeners = listener_map.get((entry["proto"], entry["port"]), [])
+        if listeners:
+            continue
+        stale.append(name)
+    return stale
+
+
+def command_alloc(args: argparse.Namespace) -> int:
+    start, end = parse_port_range(args.range)
+    meta = parse_meta(args.meta)
+    name = args.name
+    proto = args.proto
+    host = args.host
+    persistent_requested = bool(args.persistent)
+
+    with registry_lock():
+        entries = load_entries(strict=True)
+        now = now_iso()
+        if name in entries:
+            entry = entries[name]
+            if entry["proto"] != proto:
+                raise PortBrokerError(
+                    f"'{name}' already exists with proto '{entry['proto']}'. "
+                    f"Free it first or re-claim with the same proto."
+                )
+            entry["host"] = host
+            entry["cwd"] = os.getcwd()
+            entry["updatedAt"] = now
+            if args.cmd is not None:
+                entry["cmd"] = args.cmd
+            entry["meta"] = merge_meta(entry.get("meta", {}), meta)
+            entry["persistent"] = bool(entry.get("persistent", False)) or persistent_requested
+            entries[name] = entry
+            save_registry(entries)
+            emit_port(name, entry["port"], args.json)
+            return 0
+
+        reserved = {entry["port"] for entry in entries.values() if entry["proto"] == proto}
+        listening = {listener.port for listener in listeners_for_proto(proto)}
+        for candidate in range(start, end + 1):
+            if candidate in reserved or candidate in listening:
+                continue
+            entries[name] = {
+                "name": name,
+                "port": candidate,
+                "host": host,
+                "proto": proto,
+                "createdAt": now,
+                "updatedAt": now,
+                "cwd": os.getcwd(),
+                "cmd": args.cmd or "",
+                "meta": meta,
+                "persistent": persistent_requested,
+            }
+            save_registry(entries)
+            emit_port(name, candidate, args.json)
+            return 0
+
+    raise PortBrokerError(f"No free {proto.upper()} ports found in range {start}-{end}.")
+
+
+def command_claim(args: argparse.Namespace) -> int:
+    name = args.name
+    port = parse_port(args.port)
+    proto = args.proto
+    host = args.host
+    meta = parse_meta(args.meta)
+
+    with registry_lock():
+        entries = load_entries(strict=True)
+
+        for other_name, other in entries.items():
+            if other_name == name:
+                continue
+            if other["proto"] == proto and other["port"] == port:
+                raise PortBrokerError(f"Port {port}/{proto} is already reserved by '{other_name}'.")
+
+        listeners = [listener for listener in listeners_for_proto(proto) if listener.port == port]
+        if listeners:
+            raise PortBrokerError(f"Port {port}/{proto} is already in use by {listener_owner_summary(listeners)}.")
+
+        now = now_iso()
+        existing = entries.get(name)
+        created = existing["createdAt"] if existing else now
+        merged_meta = merge_meta(existing.get("meta", {}) if existing else {}, meta)
+        persistent = bool(args.persistent)
+        if existing and existing.get("persistent", False):
+            persistent = True
+        entries[name] = {
+            "name": name,
+            "port": port,
+            "host": host,
+            "proto": proto,
+            "createdAt": created,
+            "updatedAt": now,
+            "cwd": os.getcwd(),
+            "cmd": args.cmd or (existing.get("cmd", "") if existing else ""),
+            "meta": merged_meta,
+            "persistent": persistent,
+        }
+        save_registry(entries)
+        emit_port(name, port, args.json)
+        return 0
+
+
+def command_get(args: argparse.Namespace) -> int:
+    with registry_lock():
+        entries = load_entries(strict=True)
+        entry = entries.get(args.name)
+        if not entry:
+            raise PortBrokerError(f"No reservation found for '{args.name}'.")
+        emit_port(args.name, entry["port"], args.json)
+        return 0
+
+
+def command_free(args: argparse.Namespace) -> int:
+    with registry_lock():
+        entries = load_entries(strict=True)
+        if args.name not in entries:
+            raise PortBrokerError(f"No reservation found for '{args.name}'.")
+        removed = entries.pop(args.name)
+        save_registry(entries)
+        if args.json:
+            print(
+                json.dumps(
+                    {
+                        "freed": True,
+                        "name": args.name,
+                        "port": removed["port"],
+                        "persistent": bool(removed.get("persistent", False)),
+                    },
+                    sort_keys=True,
+                )
+            )
+        return 0
+
+
+def command_cleanup(args: argparse.Namespace) -> int:
+    with registry_lock():
+        entries = load_entries(strict=True)
+        stale_names = find_stale_names(entries)
+        removed = [
+            {
+                "name": name,
+                "port": entries[name]["port"],
+                "proto": entries[name]["proto"],
+            }
+            for name in stale_names
+        ]
+        if removed and not args.dry_run:
+            for item in removed:
+                entries.pop(item["name"], None)
+            save_registry(entries)
+
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "dryRun": bool(args.dry_run),
+                    "removedCount": len(removed),
+                    "removed": removed,
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        return 0
+
+    action = "Would free" if args.dry_run else "Freed"
+    if not removed:
+        print("No stale non-persistent reservations found.")
+        return 0
+
+    print(f"{action} {len(removed)} stale non-persistent reservation(s):")
+    for item in removed:
+        print(f"- {item['name']} {item['proto']}/{item['port']}")
+    return 0
+
+
+def command_project_init(args: argparse.Namespace) -> int:
+    path = Path(args.package_json).expanduser()
+    if path.is_dir():
+        path = path / "package.json"
+
+    if not path.exists():
+        raise PortBrokerError(f"package.json not found at '{path}'.")
+
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise PortBrokerError(f"Cannot read package.json '{path}': {exc}") from exc
+
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise PortBrokerError(
+            f"package.json '{path}' is not valid JSON ({exc.msg} at line {exc.lineno}, column {exc.colno})"
+        ) from exc
+
+    if not isinstance(data, dict):
+        raise PortBrokerError(f"package.json '{path}' must contain a JSON object.")
+
+    scripts = data.get("scripts")
+    if scripts is None:
+        scripts = {}
+        data["scripts"] = scripts
+    if not isinstance(scripts, dict):
+        raise PortBrokerError(f"package.json '{path}' field 'scripts' must be an object.")
+
+    start_raw = scripts.get("start")
+    if start_raw is None:
+        if not args.start_cmd:
+            raise PortBrokerError(
+                "package.json has no scripts.start. Re-run with --start-cmd '<command to run app>'."
+            )
+        start_cmd = args.start_cmd.strip()
+    else:
+        if not isinstance(start_raw, str):
+            raise PortBrokerError(f"package.json '{path}' field scripts.start must be a string.")
+        start_cmd = start_raw.strip()
+        if not start_cmd:
+            if not args.start_cmd:
+                raise PortBrokerError(
+                    "package.json scripts.start is empty. Re-run with --start-cmd '<command to run app>'."
+                )
+            start_cmd = args.start_cmd.strip()
+
+    if not start_cmd:
+        raise PortBrokerError("Start command cannot be empty.")
+
+    base_start, had_prefix = strip_port_env_prefix(start_cmd)
+    if not base_start:
+        raise PortBrokerError("Unable to determine underlying start command for scripts.start.")
+
+    prefix = port_env_expr(args.name)
+    rendered_start = f"{prefix} {base_start}"
+    current_start = scripts.get("start", "")
+    if not isinstance(current_start, str):
+        current_start = str(current_start)
+    changed = current_start != rendered_start
+    scripts["start"] = rendered_start
+
+    if changed:
+        try:
+            path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+        except OSError as exc:
+            raise PortBrokerError(f"Cannot write package.json '{path}': {exc}") from exc
+
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "changed": changed,
+                    "name": args.name,
+                    "packageJson": str(path),
+                    "start": scripts.get("start", ""),
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        return 0
+
+    if changed:
+        print(f"Updated {path}: scripts.start now uses portbroker for '{args.name}'.")
+    else:
+        print(f"No changes needed in {path}: scripts.start already uses portbroker logic.")
+    return 0
+
+
+def command_install_shell(args: argparse.Namespace) -> int:
+    helper_path = Path(args.helper_path).expanduser()
+    ensure_parent(helper_path)
+
+    helper_text = shell_helper_content()
+    helper_existing = None
+    if helper_path.exists():
+        if not helper_path.is_file():
+            raise PortBrokerError(f"Shell helper path '{helper_path}' is not a file.")
+        try:
+            helper_existing = helper_path.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise PortBrokerError(f"Cannot read shell helper '{helper_path}': {exc}") from exc
+
+    helper_changed = helper_existing != helper_text
+    if helper_changed:
+        try:
+            helper_path.write_text(helper_text, encoding="utf-8")
+        except OSError as exc:
+            raise PortBrokerError(f"Cannot write shell helper '{helper_path}': {exc}") from exc
+        try:
+            os.chmod(helper_path, 0o755)
+        except OSError:
+            # Non-fatal on filesystems that do not support chmod semantics.
+            pass
+
+    shell_name = args.shell
+    if shell_name == "auto":
+        detected = Path(os.environ.get("SHELL", "")).name.lower()
+        if detected in {"bash", "zsh"}:
+            shell_name = detected
+        elif args.rc_file:
+            shell_name = "custom"
+        else:
+            raise PortBrokerError(
+                "Cannot auto-detect shell from $SHELL. Use --shell bash|zsh or --rc-file PATH."
+            )
+
+    if args.rc_file:
+        rc_file = Path(args.rc_file).expanduser()
+    elif shell_name == "bash":
+        rc_file = Path.home() / ".bashrc"
+    elif shell_name == "zsh":
+        rc_file = Path.home() / ".zshrc"
+    else:
+        raise PortBrokerError("Unsupported shell target. Use --shell bash|zsh or --rc-file PATH.")
+
+    ensure_parent(rc_file)
+    existing = ""
+    if rc_file.exists():
+        try:
+            existing = rc_file.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise PortBrokerError(f"Cannot read rc file '{rc_file}': {exc}") from exc
+
+    quoted_helper = shlex.quote(str(helper_path))
+    start_marker = "# >>> portbroker shell >>>"
+    end_marker = "# <<< portbroker shell <<<"
+    block = (
+        f"{start_marker}\n"
+        f"if [ -f {quoted_helper} ]; then\n"
+        f"  source {quoted_helper}\n"
+        "fi\n"
+        f"{end_marker}\n"
+    )
+
+    marker_pattern = re.compile(rf"(?ms)^{re.escape(start_marker)}\n.*?^{re.escape(end_marker)}\n?")
+    direct_source_pattern = re.compile(
+        rf"(?m)^\s*(?:source|\.)\s+[\"']?{re.escape(str(helper_path))}[\"']?\s*$"
+    )
+    changed = False
+
+    if marker_pattern.search(existing):
+        rendered = marker_pattern.sub(block, existing, count=1)
+        changed = rendered != existing
+        new_content = rendered
+    elif direct_source_pattern.search(existing):
+        new_content = existing
+        changed = False
+    else:
+        suffix = existing
+        if suffix and not suffix.endswith("\n"):
+            suffix += "\n"
+        if suffix and not suffix.endswith("\n\n"):
+            suffix += "\n"
+        new_content = suffix + block
+        changed = True
+
+    if changed:
+        try:
+            rc_file.write_text(new_content, encoding="utf-8")
+        except OSError as exc:
+            raise PortBrokerError(f"Cannot write rc file '{rc_file}': {exc}") from exc
+
+    shell_report = shell_name if shell_name != "custom" else "custom"
+    status = {
+        "changed": bool(changed or helper_changed),
+        "helperPath": str(helper_path),
+        "helperWritten": helper_changed,
+        "rcFile": str(rc_file),
+        "rcUpdated": changed,
+        "shell": shell_report,
+    }
+    if args.json:
+        print(json.dumps(status, indent=2, sort_keys=True))
+    else:
+        action = "Updated" if changed else "Already configured"
+        print(f"{action}: {rc_file}")
+        print(f"Helper: {helper_path}")
+    return 0
+
+
+def format_table(rows: list[dict[str, Any]], columns: list[tuple[str, str]]) -> str:
+    if not rows:
+        headers = [heading for _, heading in columns]
+        return " ".join(headers) + "\n" + " ".join("-" * len(header) for header in headers)
+
+    widths: dict[str, int] = {}
+    for key, heading in columns:
+        widths[key] = len(heading)
+    for row in rows:
+        for key, _ in columns:
+            widths[key] = max(widths[key], len(str(row.get(key, ""))))
+
+    def row_to_line(values: dict[str, Any]) -> str:
+        return "  ".join(str(values.get(key, "")).ljust(widths[key]) for key, _ in columns)
+
+    header_line = "  ".join(heading.ljust(widths[key]) for key, heading in columns)
+    divider = "  ".join("-" * widths[key] for key, _ in columns)
+    body = "\n".join(row_to_line(row) for row in rows)
+    return "\n".join([header_line, divider, body])
+
+
+def command_list(args: argparse.Namespace) -> int:
+    with registry_lock():
+        entries = load_entries(strict=True)
+        listener_map = listeners_by_key(entries)
+        rows: list[dict[str, Any]] = []
+        for name in sorted(entries):
+            entry = entries[name]
+            listeners = listener_map.get((entry["proto"], entry["port"]), [])
+            pid = next((listener.pid for listener in listeners if listener.pid is not None), None)
+            rows.append(
+                {
+                    "name": name,
+                    "port": entry["port"],
+                    "host": entry["host"],
+                    "proto": entry["proto"],
+                    "cwd": entry.get("cwd", ""),
+                    "createdAt": entry.get("createdAt", ""),
+                    "lastSeenPid": "" if pid is None else str(pid),
+                    "persistent": bool(entry.get("persistent", False)),
+                }
+            )
+
+    if args.json:
+        print(json.dumps(rows, indent=2, sort_keys=True))
+        return 0
+
+    display_rows = [
+        {**row, "persistent": "yes" if row["persistent"] else "no"}
+        for row in rows
+    ]
+
+    columns = [
+        ("name", "NAME"),
+        ("port", "PORT"),
+        ("host", "HOST"),
+        ("proto", "PROTO"),
+        ("persistent", "PERSISTENT"),
+        ("cwd", "CWD"),
+        ("createdAt", "CREATED_AT"),
+        ("lastSeenPid", "LAST_SEEN_PID"),
+    ]
+    print(format_table(display_rows, columns))
+    return 0
+
+
+def command_probe(args: argparse.Namespace) -> int:
+    port = parse_port(args.port)
+    proto = args.proto
+    listeners = [listener for listener in listeners_for_proto(proto) if listener.port == port]
+
+    if args.json:
+        print(json.dumps([listener.to_dict() for listener in listeners], indent=2, sort_keys=True))
+    else:
+        if not listeners:
+            print(f"No listener found on {proto}/{port}.")
+            return 1
+        for listener in listeners:
+            process = listener.process_name or "unknown"
+            pid = str(listener.pid) if listener.pid is not None else "?"
+            print(f"{proto} {listener.host}:{listener.port} process={process} pid={pid} via={listener.source}")
+    return 0
+
+
+def command_web(args: argparse.Namespace) -> int:
+    requested_port = parse_port(args.port) if args.port is not None else None
+    reserved_port = reserve_web_port(
+        name=args.name,
+        host=args.host,
+        requested_port=requested_port,
+        range_value=args.range,
+        persistent=bool(args.persistent),
+    )
+
+    try:
+        server = PortBrokerDashboardServer(args.host, reserved_port, args.name, bool(args.verbose))
+    except OSError as exc:
+        raise PortBrokerError(f"Cannot bind dashboard on {args.host}:{reserved_port}: {exc}") from exc
+
+    print(f"Serving {args.name} on {args.host}:{reserved_port}")
+    print(f"Open {dashboard_open_url(args.host, reserved_port)}")
+    print("Press Ctrl+C to stop.")
+
+    try:
+        server.serve_forever(poll_interval=0.5)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+
+    return 0
+
+
+def command_doctor(args: argparse.Namespace) -> int:
+    with registry_lock():
+        raw = load_registry_raw()
+        normalized, issues = normalize_entries(raw.get("entries", {}))
+        listener_map = listeners_by_key(normalized) if normalized else {}
+
+    for name, entry in sorted(normalized.items()):
+        listeners = listener_map.get((entry["proto"], entry["port"]), [])
+        if not listeners:
+            continue
+        process_names = [listener.process_name.lower() for listener in listeners if listener.process_name]
+        if not process_names:
+            issues.append(
+                {
+                    "level": "warning",
+                    "name": name,
+                    "message": f"Port {entry['port']}/{entry['proto']} is in use but process owner is unknown.",
+                }
+            )
+            continue
+        expected = expected_process_name(entry.get("cmd", ""))
+        if expected and expected not in process_names:
+            found = ", ".join(sorted(set(process_names)))
+            issues.append(
+                {
+                    "level": "error",
+                    "name": name,
+                    "message": (
+                        f"Port {entry['port']}/{entry['proto']} appears to be owned by "
+                        f"'{found}', not expected '{expected}'."
+                    ),
+                }
+            )
+        elif not expected and not any(name.lower() in proc for proc in process_names):
+            found = ", ".join(sorted(set(process_names)))
+            issues.append(
+                {
+                    "level": "warning",
+                    "name": name,
+                    "message": (
+                        f"Port {entry['port']}/{entry['proto']} is active in process '{found}'. "
+                        "No --cmd was recorded, so ownership cannot be confirmed."
+                    ),
+                }
+            )
+
+    status = {
+        "ok": not any(issue["level"] == "error" for issue in issues),
+        "issueCount": len(issues),
+        "issues": issues,
+    }
+
+    if args.json:
+        print(json.dumps(status, indent=2, sort_keys=True))
+        return 0 if status["ok"] else 1
+
+    if not issues:
+        print("Registry looks healthy.")
+        print(f"Entries checked: {len(normalized)}")
+        return 0
+
+    for issue in issues:
+        level = issue["level"].upper()
+        name = issue["name"]
+        message = issue["message"]
+        print(f"[{level}] {name}: {message}")
+        if name != "-":
+            print(f"  Suggestion: portbroker free --name {name}")
+            print(f"  Or:         portbroker alloc --name {name}")
+
+    return 1 if not status["ok"] else 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="portbroker", description="Port reservation broker for homelab services.")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    alloc_parser = subparsers.add_parser("alloc", help="Allocate a free port and reserve it for a name.")
+    alloc_parser.add_argument("--name", required=True, help="Reservation name.")
+    alloc_parser.add_argument("--range", default=DEFAULT_RANGE, help=f"Port range START-END (default: {DEFAULT_RANGE}).")
+    alloc_parser.add_argument("--host", default=DEFAULT_HOST, help=f"Host to store in reservation (default: {DEFAULT_HOST}).")
+    alloc_parser.add_argument("--proto", default=DEFAULT_PROTO, choices=sorted(SUPPORTED_PROTOS), help="Protocol.")
+    alloc_parser.add_argument("-p", "--persistent", action="store_true", help="Mark reservation as persistent.")
+    alloc_parser.add_argument("--meta", action="append", nargs="+", metavar="key=value", help="Metadata key=value.")
+    alloc_parser.add_argument("--cmd", help="Optional command to store with the reservation.")
+    alloc_parser.add_argument("--json", action="store_true", help="Print JSON output.")
+    alloc_parser.set_defaults(func=command_alloc)
+
+    claim_parser = subparsers.add_parser("claim", help="Reserve an explicit port for a name.")
+    claim_parser.add_argument("--name", required=True, help="Reservation name.")
+    claim_parser.add_argument("--port", required=True, help="Port to claim.")
+    claim_parser.add_argument("--host", default=DEFAULT_HOST, help=f"Host to store in reservation (default: {DEFAULT_HOST}).")
+    claim_parser.add_argument("--proto", default=DEFAULT_PROTO, choices=sorted(SUPPORTED_PROTOS), help="Protocol.")
+    claim_parser.add_argument("-p", "--persistent", action="store_true", help="Mark reservation as persistent.")
+    claim_parser.add_argument("--meta", action="append", nargs="+", metavar="key=value", help="Metadata key=value.")
+    claim_parser.add_argument("--cmd", help="Optional command to store with the reservation.")
+    claim_parser.add_argument("--json", action="store_true", help="Print JSON output.")
+    claim_parser.set_defaults(func=command_claim)
+
+    get_parser = subparsers.add_parser("get", help="Get an existing reservation by name.")
+    get_parser.add_argument("--name", required=True, help="Reservation name.")
+    get_parser.add_argument("--json", action="store_true", help="Print JSON output.")
+    get_parser.set_defaults(func=command_get)
+
+    free_parser = subparsers.add_parser("free", help="Free an existing reservation.")
+    free_parser.add_argument("--name", required=True, help="Reservation name.")
+    free_parser.add_argument("--json", action="store_true", help="Print JSON output.")
+    free_parser.set_defaults(func=command_free)
+
+    list_parser = subparsers.add_parser("list", help="List reservations.")
+    list_parser.add_argument("--json", action="store_true", help="Print JSON output.")
+    list_parser.set_defaults(func=command_list)
+
+    cleanup_parser = subparsers.add_parser("cleanup", help="Free stale non-persistent reservations.")
+    cleanup_parser.add_argument("--dry-run", action="store_true", help="Show what would be freed.")
+    cleanup_parser.add_argument("--json", action="store_true", help="Print JSON output.")
+    cleanup_parser.set_defaults(func=command_cleanup)
+
+    project_init_parser = subparsers.add_parser(
+        "project-init",
+        help="Patch package.json so npm start derives PORT from portbroker.",
+    )
+    project_init_parser.add_argument("--name", required=True, help="Reservation name to embed in npm start.")
+    project_init_parser.add_argument(
+        "--package-json",
+        default="package.json",
+        help="Path to package.json (or project directory containing package.json).",
+    )
+    project_init_parser.add_argument(
+        "--start-cmd",
+        help="Fallback start command if scripts.start is missing/empty.",
+    )
+    project_init_parser.add_argument("--json", action="store_true", help="Print JSON output.")
+    project_init_parser.set_defaults(func=command_project_init)
+
+    install_shell_parser = subparsers.add_parser(
+        "install-shell",
+        help="Install shell helper (dev function) into bash/zsh rc files.",
+    )
+    install_shell_parser.add_argument(
+        "--shell",
+        choices=["auto", "bash", "zsh"],
+        default="auto",
+        help="Target shell (default: auto-detect from $SHELL).",
+    )
+    install_shell_parser.add_argument(
+        "--rc-file",
+        help="Override rc file path (for custom shell setup or testing).",
+    )
+    install_shell_parser.add_argument(
+        "--helper-path",
+        default=str(DEFAULT_SHELL_HELPER),
+        help=f"Destination path for installed shell helper script (default: {DEFAULT_SHELL_HELPER}).",
+    )
+    install_shell_parser.add_argument("--json", action="store_true", help="Print JSON output.")
+    install_shell_parser.set_defaults(func=command_install_shell)
+
+    web_parser = subparsers.add_parser(
+        "web",
+        help="Run a live dashboard for portbroker reservations.",
+    )
+    web_parser.add_argument(
+        "--name",
+        default=DEFAULT_WEB_NAME,
+        help=f"Reservation name for the dashboard service (default: {DEFAULT_WEB_NAME}).",
+    )
+    web_parser.add_argument(
+        "--host",
+        default=DEFAULT_HOST,
+        help=f"Host to bind and store in the reservation (default: {DEFAULT_HOST}).",
+    )
+    web_parser.add_argument(
+        "--port",
+        help="Explicit port to bind. If omitted, reuse the reserved port or allocate one from --range.",
+    )
+    web_parser.add_argument(
+        "--range",
+        default=DEFAULT_RANGE,
+        help=f"Port range START-END used when auto-allocating (default: {DEFAULT_RANGE}).",
+    )
+    web_parser.add_argument("-p", "--persistent", action="store_true", help="Keep the dashboard reservation persistent.")
+    web_parser.add_argument("--verbose", action="store_true", help="Enable access logs for dashboard requests.")
+    web_parser.set_defaults(func=command_web)
+
+    doctor_parser = subparsers.add_parser("doctor", help="Check registry integrity and potential drift.")
+    doctor_parser.add_argument("--json", action="store_true", help="Print JSON output.")
+    doctor_parser.set_defaults(func=command_doctor)
+
+    probe_parser = subparsers.add_parser("probe", help="Inspect which process is listening on a port.")
+    probe_parser.add_argument("--port", required=True, help="Port to inspect.")
+    probe_parser.add_argument("--proto", default=DEFAULT_PROTO, choices=sorted(SUPPORTED_PROTOS), help="Protocol.")
+    probe_parser.add_argument("--json", action="store_true", help="Print JSON output.")
+    probe_parser.set_defaults(func=command_probe)
+
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    try:
+        return int(args.func(args))
+    except PortBrokerError as exc:
+        print(f"portbroker: error: {exc}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        print("portbroker: interrupted", file=sys.stderr)
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())
