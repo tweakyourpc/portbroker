@@ -1,120 +1,87 @@
 # portbroker
 
-`portbroker` is a lightweight named port registry for homelab and AI agent environments.
+Named port registry plus live dashboard for concurrent local development sessions.
 
-- Python standard library only (no external dependencies)
-- Single-file CLI tool for deterministic port allocation and reuse
-- Built for multi-project, concurrent CLI agent workflows
+![portbroker routing named reservations without port collisions](docs/hero.png)
 
-## Why this exists (AI agent skill first)
+## Why this exists
 
-`portbroker` was designed to be used as a Codex/CLI agent skill so agents automatically allocate ports without conflicts across multiple concurrent projects.
-
-Instead of hard-coding `3000`, `8000`, etc., agents should always request a named reservation first, then start services with that port.
+Multiple local services and coding agents frequently try to bind the same familiar ports. `portbroker` gives each service a stable named reservation, so sessions can start reliably without hardcoded port collisions.
 
 ## Install
 
 ```bash
-chmod +x portbroker && sudo install -m 0755 portbroker /usr/local/bin/portbroker
+curl -fsSL https://raw.githubusercontent.com/tweakyourpc/portbroker/main/install.sh | sh
 ```
 
-## Core commands
+The installer requires Linux or macOS and Python 3.11 or newer. It installs the CLI, dashboard asset, and detected coding-agent instructions in your user directories.
 
-Use named allocations so a service keeps a stable port identity.
+## Quick start
 
 ```bash
-# alloc: reserve a free port for a name
-PORT=$(portbroker alloc --name my-service --host 0.0.0.0 --persistent)
-echo "$PORT"
-
-# get: read an existing reservation
-portbroker get --name my-service
-
-# list: show all reservations
-portbroker list
-
-# probe: inspect listeners on a specific port
-portbroker probe --port "$PORT"
-
-# doctor: validate registry health
-portbroker doctor
-
-# free: release a reservation
-portbroker free --name my-service
-
-# cleanup: remove stale non-persistent reservations
-portbroker cleanup
+PORT="$(portbroker alloc --name my-app --persistent)"
+python3 -m http.server "$PORT" --bind 0.0.0.0
 ```
 
-## Dashboard (`web`)
-
-Start the dashboard with a named reservation:
+Start the dashboard in another terminal:
 
 ```bash
-PORT=$(portbroker get --name portbroker-dashboard 2>/dev/null || portbroker alloc --name portbroker-dashboard --persistent)
-portbroker web --name portbroker-dashboard --host 0.0.0.0 --port "$PORT" --persistent
+PORT="$(portbroker get --name portbroker-dashboard 2>/dev/null || portbroker alloc --name portbroker-dashboard --persistent)"
+portbroker web --port "$PORT" --persistent
 ```
 
-The dashboard shows live reservation and listener state, including service name, port, host/proto, status, process metadata, persistence, and timestamps.
+Open the URL printed by `portbroker web`.
 
-Endpoints:
+## How it works with AI agents
 
-- `GET /` dashboard UI
-- `GET /api/ports` JSON view of tracked ports and listener state
-- `GET /whoami` service identity (`service`, `version`, `pid`, `startedAt`, `host`, `port`)
-
-## Dev shell helper (`portbroker-shell.sh`)
-
-The helper script is at `scripts/portbroker-shell.sh`.
-
-Source it in your shell:
+`portbroker install-skill` detects Claude Code, Codex, and OpenCode configuration directories and installs short instructions that require port reservation before starting network services. Re-running it is safe: a managed marker prevents duplicated instructions.
 
 ```bash
-source /path/to/portbroker-tool-src/scripts/portbroker-shell.sh
+portbroker install-skill
+portbroker install-skill --agents codex,opencode --dry-run
 ```
 
-Then run:
+## CLI commands
 
-```bash
-dev my-app
-```
+| Command | Purpose |
+| --- | --- |
+| `portbroker alloc --name api-server --persistent` | Allocate or reuse a named reservation |
+| `portbroker claim --name dev-proxy --port PORT` | Reserve an explicit available port |
+| `portbroker get --name my-app` | Print an existing reserved port |
+| `portbroker list` | Show reservations and listeners |
+| `portbroker free --name my-app` | Remove a reservation |
+| `portbroker cleanup` | Remove stale non-persistent reservations |
+| `portbroker probe --port PORT` | Inspect a listener |
+| `portbroker doctor` | Check registry integrity |
+| `portbroker web` | Start the live dashboard |
+| `portbroker install-skill` | Configure detected coding agents |
+| `portbroker install-shell` | Install the optional shell helper |
+| `portbroker project-init` | Add reservation logic to `npm start` |
 
-`dev` will run `portbroker cleanup` in the background, reserve a persistent named port, export `PORT`, and start `npm start`.
+See [USAGE.md](USAGE.md) for detailed command options and workflows.
 
-## systemd user service (persistent dashboard)
+## Dashboard
 
-Create `~/.config/systemd/user/portbroker-dashboard.service`:
+![portbroker dashboard showing generic service reservations](docs/dashboard.png)
 
-```ini
-[Unit]
-Description=Portbroker Dashboard
-After=network-online.target
-Wants=network-online.target
+The bundled dashboard is the merged successor to `portbroker-dashboard`. It groups services using optional `meta.group` values, reports listener status, and supports termination of an active process from the UI.
 
-[Service]
-Type=simple
-ExecStart=/usr/local/bin/portbroker web --name portbroker-dashboard --host 0.0.0.0 --persistent
-Restart=on-failure
-RestartSec=2
+The kill action is guarded: the server sends `SIGTERM` only to a PID currently verified as listening on an endpoint present in the portbroker registry. It does not send `SIGKILL`.
 
-[Install]
-WantedBy=default.target
-```
+## API endpoints
 
-Enable and start:
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `GET` | `/` | Serve the dashboard UI |
+| `GET` | `/api/ports` | Return reservations, groups, and listener status |
+| `GET` | `/api/health` | Return dashboard health |
+| `GET` | `/whoami` | Return service identity and bind details |
+| `POST` | `/api/kill/<pid>` | Send guarded `SIGTERM` to a verified active listener |
 
-```bash
-systemctl --user daemon-reload
-systemctl --user enable --now portbroker-dashboard.service
-systemctl --user status portbroker-dashboard.service
-```
+## Native platform support
 
-## Privacy
+Native support requests have been filed with [Anthropic Claude Code](https://github.com/anthropics/claude-code/issues/34385) and [OpenAI Codex](https://github.com/openai/codex/issues/16483).
 
-Registry data is local only: `~/.config/portbroker/ports.json`.
+## License
 
-It contains project names, assigned ports, and working directory paths. Do not share this file.
-
-## More usage
-
-See [USAGE.md](USAGE.md) for full command details.
+MIT. See [LICENSE](LICENSE).

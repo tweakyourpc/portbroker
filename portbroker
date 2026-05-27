@@ -3,12 +3,12 @@ from __future__ import annotations
 
 import argparse
 import fcntl
-import html
 import json
 import os
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -21,15 +21,16 @@ from typing import Any
 from urllib.error import URLError
 from urllib.request import urlopen
 
-PORTBROKER_VERSION = "1.1.0"
+PORTBROKER_VERSION = "1.2.0"
 DEFAULT_RANGE = "8700-8999"
 DEFAULT_HOST = "0.0.0.0"
 DEFAULT_PROTO = "tcp"
 SUPPORTED_PROTOS = {"tcp", "udp"}
 DEFAULT_SHELL_HELPER = Path.home() / ".config" / "portbroker" / "portbroker-shell.sh"
 DEFAULT_WEB_NAME = "portbroker-dashboard"
-DASHBOARD_REFRESH_MS = 5000
 WHOAMI_TIMEOUT_SECONDS = 0.35
+SKILL_MARKER = "# managed by portbroker install-skill"
+SUPPORTED_AGENTS = {"claude-code", "codex", "opencode"}
 
 
 class PortBrokerError(Exception):
@@ -81,6 +82,27 @@ def registry_path() -> Path:
     if explicit:
         return Path(explicit).expanduser()
     return config_dir() / "ports.json"
+
+
+def data_dir() -> Path:
+    xdg = os.environ.get("XDG_DATA_HOME")
+    if xdg:
+        return Path(xdg).expanduser() / "portbroker"
+    return Path.home() / ".local" / "share" / "portbroker"
+
+
+def dashboard_path() -> Path:
+    adjacent = Path(__file__).resolve().with_name("dashboard.html")
+    if adjacent.exists():
+        return adjacent
+    return data_dir() / "dashboard.html"
+
+
+def skills_dir() -> Path:
+    adjacent = Path(__file__).resolve().with_name("skills")
+    if adjacent.is_dir():
+        return adjacent
+    return data_dir() / "skills"
 
 
 def lock_path() -> Path:
@@ -607,18 +629,26 @@ def build_dashboard_snapshot(service_name: str, version: str) -> dict[str, Any]:
         listener_map, listener_error = safe_listeners_by_key(entries)
 
     rows: list[dict[str, Any]] = []
+    buckets: dict[str, list[dict[str, Any]]] = {}
     active_count = 0
     persistent_count = 0
-    inactive_count = 0
+    reserved_count = 0
+    retired_count = 0
     unknown_count = 0
+    has_groups = any(entry.get("meta", {}).get("group") for entry in entries.values())
 
-    for name in sorted(entries):
+    for name in sorted(entries, key=str.lower):
         entry = entries[name]
         listeners = listener_map.get((entry["proto"], entry["port"]), [])
+        lifecycle = str(entry.get("meta", {}).get("lifecycle", "")).lower()
         if listener_error:
             status = "unknown"
             active: bool | None = None
             unknown_count += 1
+        elif lifecycle == "retired":
+            status = "retired"
+            active = False
+            retired_count += 1
         elif listeners:
             status = "active"
             active = True
@@ -626,37 +656,47 @@ def build_dashboard_snapshot(service_name: str, version: str) -> dict[str, Any]:
         else:
             status = "reserved"
             active = False
-            inactive_count += 1
+            reserved_count += 1
 
         if entry.get("persistent", False):
             persistent_count += 1
 
-        last_seen_pid = next((listener.pid for listener in listeners if listener.pid is not None), None)
-        rows.append(
-            {
-                "name": name,
-                "port": entry["port"],
-                "host": entry["host"],
-                "proto": entry["proto"],
-                "status": status,
-                "active": active,
-                "persistent": bool(entry.get("persistent", False)),
-                "cwd": entry.get("cwd", ""),
-                "cmd": entry.get("cmd", ""),
-                "createdAt": entry.get("createdAt", ""),
-                "updatedAt": entry.get("updatedAt", ""),
-                "lastSeenPid": last_seen_pid,
-                "listenerCount": len(listeners),
-                "listeners": sorted(
-                    {
-                        f"{listener.process_name or 'unknown'}"
-                        + (f"(pid={listener.pid})" if listener.pid is not None else "")
-                        for listener in listeners
-                    }
-                ),
-                "meta": entry.get("meta", {}),
-            }
-        )
+        row = {
+            "name": name,
+            "port": entry["port"],
+            "host": entry["host"],
+            "proto": entry["proto"],
+            "status": status,
+            "active": active,
+            "persistent": bool(entry.get("persistent", False)),
+            "cwd": entry.get("cwd", ""),
+            "cmd": entry.get("cmd", ""),
+            "createdAt": entry.get("createdAt", ""),
+            "updatedAt": entry.get("updatedAt", ""),
+            "lastSeenPid": next((listener.pid for listener in listeners if listener.pid is not None), None),
+            "listenerCount": len(listeners),
+            "listeners": sorted(
+                {
+                    f"{listener.process_name or 'unknown'}"
+                    + (f"(pid={listener.pid})" if listener.pid is not None else "")
+                    for listener in listeners
+                }
+            ),
+            "meta": entry.get("meta", {}),
+        }
+        rows.append(row)
+        group_key = str(row["meta"].get("group") or ("ungrouped" if has_groups else "default"))
+        buckets.setdefault(group_key, []).append(row)
+
+    groups = []
+    for key in sorted(buckets, key=lambda value: (value == "ungrouped", value.lower())):
+        if key == "default":
+            label = "Services"
+        elif key == "ungrouped":
+            label = "Ungrouped"
+        else:
+            label = key.replace("-", " ").replace("_", " ").title()
+        groups.append({"key": key, "label": label, "defaultExpanded": True, "items": buckets[key]})
 
     return {
         "service": service_name,
@@ -667,13 +707,14 @@ def build_dashboard_snapshot(service_name: str, version: str) -> dict[str, Any]:
         "summary": {
             "total": len(rows),
             "active": active_count,
-            "reserved": inactive_count,
+            "reserved": reserved_count,
+            "retired": retired_count,
             "persistent": persistent_count,
             "unknown": unknown_count,
         },
         "ports": rows,
+        "groups": groups,
     }
-
 
 def whoami_probe_url(host: str, port: int) -> str:
     probe_host = host or "127.0.0.1"
@@ -836,411 +877,6 @@ def dashboard_open_url(host: str, port: int) -> str:
     return f"http://{host}:{port}"
 
 
-def render_dashboard_html(service_name: str, version: str) -> str:
-    title = html.escape(service_name)
-    version_label = html.escape(version)
-    return f"""<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{title}</title>
-<style>
-:root {{
-  color-scheme: light;
-  --bg: #f4efe6;
-  --panel: rgba(255, 255, 255, 0.88);
-  --ink: #1f2933;
-  --muted: #5b6673;
-  --line: rgba(31, 41, 51, 0.12);
-  --accent: #0f766e;
-  --idle: #475569;
-  --warn: #b45309;
-  --shadow: 0 20px 48px rgba(31, 41, 51, 0.08);
-  font-family: "IBM Plex Sans", "Segoe UI Variable", "Trebuchet MS", sans-serif;
-}}
-* {{
-  box-sizing: border-box;
-}}
-body {{
-  margin: 0;
-  min-height: 100vh;
-  background:
-    radial-gradient(circle at top right, rgba(15, 118, 110, 0.14), transparent 40%),
-    linear-gradient(145deg, #f8f4ec, #eef5f6);
-  color: var(--ink);
-}}
-.shell {{
-  max-width: 1180px;
-  margin: 0 auto;
-  padding: 2.5rem 1.2rem 3rem;
-}}
-.hero {{
-  margin-bottom: 1.5rem;
-}}
-.eyebrow {{
-  margin: 0;
-  font-size: 0.85rem;
-  font-weight: 700;
-  letter-spacing: 0.12em;
-  text-transform: uppercase;
-  color: var(--accent);
-}}
-h1 {{
-  margin: 0.35rem 0 0.5rem;
-  font-size: clamp(2rem, 4vw, 3.3rem);
-  line-height: 1.05;
-}}
-.lede {{
-  margin: 0;
-  max-width: 44rem;
-  color: var(--muted);
-}}
-.grid {{
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
-  gap: 0.9rem;
-  margin: 1.4rem 0 1rem;
-}}
-.card {{
-  background: var(--panel);
-  border: 1px solid var(--line);
-  border-radius: 18px;
-  padding: 1rem 1.1rem;
-  box-shadow: var(--shadow);
-}}
-.card span {{
-  display: block;
-  font-size: 0.8rem;
-  font-weight: 700;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-  color: var(--muted);
-}}
-.card strong {{
-  display: block;
-  margin-top: 0.45rem;
-  font-size: 1.7rem;
-}}
-.hint {{
-  margin: 0 0 1rem;
-  color: var(--muted);
-}}
-.banner {{
-  margin: 0 0 1rem;
-  padding: 0.8rem 1rem;
-  border-radius: 14px;
-  border: 1px solid rgba(180, 83, 9, 0.18);
-  background: rgba(180, 83, 9, 0.08);
-  color: var(--warn);
-}}
-.table-wrap {{
-  overflow-x: auto;
-  background: var(--panel);
-  border: 1px solid var(--line);
-  border-radius: 20px;
-  box-shadow: var(--shadow);
-}}
-table {{
-  width: 100%;
-  border-collapse: collapse;
-}}
-th, td {{
-  padding: 0.9rem 1rem;
-  text-align: left;
-  border-bottom: 1px solid var(--line);
-  vertical-align: top;
-}}
-th {{
-  font-size: 0.8rem;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-  color: var(--muted);
-}}
-tbody tr:last-child td {{
-  border-bottom: 0;
-}}
-.mono {{
-  font-family: "IBM Plex Mono", "Cascadia Mono", "SFMono-Regular", monospace;
-}}
-.process {{
-  min-width: 14rem;
-}}
-.site-name {{
-  min-width: 14rem;
-}}
-.site-link {{
-  color: var(--accent);
-  text-decoration: none;
-  font-weight: 700;
-}}
-.site-link:hover {{
-  text-decoration: underline;
-}}
-.site-fallback {{
-  margin-top: 0.3rem;
-  font-size: 0.78rem;
-  color: var(--muted);
-}}
-.site-fallback a {{
-  color: inherit;
-}}
-.pill {{
-  display: inline-flex;
-  align-items: center;
-  border-radius: 999px;
-  padding: 0.2rem 0.65rem;
-  font-size: 0.78rem;
-  font-weight: 700;
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
-}}
-.pill.active {{
-  background: rgba(15, 118, 110, 0.12);
-  color: var(--accent);
-}}
-.pill.reserved {{
-  background: rgba(71, 85, 105, 0.12);
-  color: var(--idle);
-}}
-.pill.unknown {{
-  background: rgba(180, 83, 9, 0.12);
-  color: var(--warn);
-}}
-.footer {{
-  display: flex;
-  flex-wrap: wrap;
-  gap: 0.9rem;
-  margin-top: 1rem;
-  color: var(--muted);
-  font-size: 0.9rem;
-}}
-code {{
-  font-family: "IBM Plex Mono", "Cascadia Mono", "SFMono-Regular", monospace;
-}}
-@media (max-width: 720px) {{
-  .shell {{
-    padding: 1.3rem 0.75rem 2rem;
-  }}
-  th, td {{
-    padding: 0.75rem;
-  }}
-}}
-</style>
-</head>
-<body>
-<main class="shell">
-  <section class="hero">
-    <p class="eyebrow">Port Broker Dashboard</p>
-    <h1>{title}</h1>
-    <p class="lede">Live reservation and listener state from the local portbroker registry.</p>
-  </section>
-  <section class="grid">
-    <article class="card"><span>Total</span><strong id="totalCount">-</strong></article>
-    <article class="card"><span>Active</span><strong id="activeCount">-</strong></article>
-    <article class="card"><span>Reserved</span><strong id="reservedCount">-</strong></article>
-    <article class="card"><span>Persistent</span><strong id="persistentCount">-</strong></article>
-  </section>
-  <p class="hint" id="checkedAt">Waiting for first refresh...</p>
-  <p class="banner" id="warning" hidden></p>
-  <section class="table-wrap">
-    <table>
-      <thead>
-        <tr>
-          <th>Name</th>
-          <th>Port</th>
-          <th>Host</th>
-          <th>Proto</th>
-          <th>Status</th>
-          <th>Process</th>
-          <th>Persistent</th>
-          <th>Updated</th>
-        </tr>
-      </thead>
-      <tbody id="rows">
-        <tr><td colspan="8">Loading...</td></tr>
-      </tbody>
-    </table>
-  </section>
-  <footer class="footer">
-    <span>v{version_label}</span>
-    <span><code>/api/ports</code></span>
-    <span><code>/whoami</code></span>
-  </footer>
-</main>
-<script>
-const refreshMs = {DASHBOARD_REFRESH_MS};
-// Safe default for local access; browser hostname can override this automatically.
-const fallbackLanHost = '127.0.0.1';
-const rowsNode = document.getElementById('rows');
-const warningNode = document.getElementById('warning');
-
-function setText(id, value) {{
-  document.getElementById(id).textContent = String(value);
-}}
-
-function appendCell(row, value, className) {{
-  const cell = document.createElement('td');
-  if (className) {{
-    cell.className = className;
-  }}
-  cell.textContent = value;
-  row.appendChild(cell);
-}}
-
-function isWildcardOrLoopback(host) {{
-  const value = String(host || '').trim().toLowerCase();
-  return (
-    !value ||
-    value === '0.0.0.0' ||
-    value === '::' ||
-    value === '*' ||
-    value === 'localhost' ||
-    value === '127.0.0.1' ||
-    value === '::1'
-  );
-}}
-
-function normalizedHost(host) {{
-  const browserHost = String(window.location.hostname || '').trim();
-  if (isWildcardOrLoopback(host)) {{
-    return browserHost || fallbackLanHost;
-  }}
-  return String(host || '').trim();
-}}
-
-function httpUrl(host, port) {{
-  const formattedHost = host.includes(':') && !host.startsWith('[') && !host.endsWith(']')
-    ? `[${{host}}]`
-    : host;
-  return `http://${{formattedHost}}:${{port}}`;
-}}
-
-function appendNameCell(row, item) {{
-  const cell = document.createElement('td');
-  cell.className = 'site-name';
-  const name = item.name || '';
-  const port = Number(item.port);
-  const isTcp = String(item.proto || '').toLowerCase() === 'tcp';
-  if (!isTcp || !Number.isInteger(port) || port < 1 || port > 65535) {{
-    cell.textContent = name;
-    row.appendChild(cell);
-    return;
-  }}
-
-  const primaryHost = normalizedHost(item.host);
-  const primaryLink = document.createElement('a');
-  primaryLink.className = 'site-link';
-  primaryLink.href = httpUrl(primaryHost, port);
-  primaryLink.textContent = name || `${{primaryHost}}:${{port}}`;
-  cell.appendChild(primaryLink);
-
-  if (primaryHost !== fallbackLanHost) {{
-    const fallback = document.createElement('div');
-    fallback.className = 'site-fallback';
-    fallback.appendChild(document.createTextNode('fallback '));
-    const fallbackLink = document.createElement('a');
-    fallbackLink.href = httpUrl(fallbackLanHost, port);
-    fallbackLink.textContent = `${{fallbackLanHost}}:${{port}}`;
-    fallback.appendChild(fallbackLink);
-    cell.appendChild(fallback);
-  }}
-
-  row.appendChild(cell);
-}}
-
-function appendStatus(row, status) {{
-  const cell = document.createElement('td');
-  const pill = document.createElement('span');
-  pill.className = `pill ${{status}}`;
-  if (status === 'active') {{
-    pill.textContent = 'Active';
-  }} else if (status === 'reserved') {{
-    pill.textContent = 'Reserved';
-  }} else {{
-    pill.textContent = 'Unknown';
-  }}
-  cell.appendChild(pill);
-  row.appendChild(cell);
-}}
-
-function renderRows(items) {{
-  rowsNode.textContent = '';
-  if (!items.length) {{
-    const row = document.createElement('tr');
-    const cell = document.createElement('td');
-    cell.colSpan = 8;
-    cell.textContent = 'No reservations in the registry.';
-    row.appendChild(cell);
-    rowsNode.appendChild(row);
-    return;
-  }}
-
-  for (const item of items) {{
-    const row = document.createElement('tr');
-    const tooltip = [];
-    if (item.cwd) {{
-      tooltip.push(`cwd: ${{item.cwd}}`);
-    }}
-    if (item.cmd) {{
-      tooltip.push(`cmd: ${{item.cmd}}`);
-    }}
-    const metaEntries = Object.entries(item.meta || {{}});
-    if (metaEntries.length) {{
-      tooltip.push('meta: ' + metaEntries.map(([key, value]) => key + '=' + value).join(', '));
-    }}
-    if (tooltip.length) {{
-      row.title = tooltip.join('\\n');
-    }}
-
-    appendNameCell(row, item);
-    appendCell(row, String(item.port ?? ''), 'mono');
-    appendCell(row, normalizedHost(item.host), 'mono');
-    appendCell(row, item.proto || '', 'mono');
-    appendStatus(row, item.status || 'unknown');
-
-    const processes = Array.isArray(item.listeners) && item.listeners.length ? item.listeners.join(', ') : 'idle';
-    appendCell(row, processes, 'mono process');
-    appendCell(row, item.persistent ? 'yes' : 'no');
-    appendCell(row, item.updatedAt || item.createdAt || '', 'mono');
-    rowsNode.appendChild(row);
-  }}
-}}
-
-async function refresh() {{
-  try {{
-    const response = await fetch('/api/ports', {{ cache: 'no-store' }});
-    const data = await response.json();
-    if (!response.ok) {{
-      throw new Error(data.error || `HTTP ${{response.status}}`);
-    }}
-
-    setText('totalCount', data.summary?.total ?? 0);
-    setText('activeCount', data.summary?.active ?? 0);
-    setText('reservedCount', data.summary?.reserved ?? 0);
-    setText('persistentCount', data.summary?.persistent ?? 0);
-
-    const checkedAt = data.checkedAt ? `Last checked ${{data.checkedAt}}` : 'Waiting for first refresh...';
-    const registry = data.registryPath ? ` • Registry ${{data.registryPath}}` : '';
-    setText('checkedAt', `${{checkedAt}}${{registry}}`);
-
-    warningNode.hidden = !data.listenerError;
-    warningNode.textContent = data.listenerError || '';
-    renderRows(data.ports || []);
-  }} catch (error) {{
-    warningNode.hidden = false;
-    warningNode.textContent = `Refresh failed: ${{error.message}}`;
-  }}
-}}
-
-refresh();
-window.setInterval(refresh, refreshMs);
-</script>
-</body>
-</html>
-"""
-
-
 class PortBrokerDashboardHandler(BaseHTTPRequestHandler):
     server_version = f"portbroker/{PORTBROKER_VERSION}"
     sys_version = ""
@@ -1258,19 +894,24 @@ class PortBrokerDashboardHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def send_html(self, body: str) -> None:
-        encoded = body.encode("utf-8")
+    def send_dashboard(self) -> None:
+        path = dashboard_path()
+        try:
+            body = path.read_bytes()
+        except OSError as exc:
+            self.send_json({"error": f"Cannot load dashboard asset '{path}': {exc}"}, status=500)
+            return
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Cache-Control", "no-store")
-        self.send_header("Content-Length", str(len(encoded)))
+        self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(encoded)
+        self.wfile.write(body)
 
     def do_GET(self) -> None:
         path = self.path.split("?", 1)[0]
         if path == "/":
-            self.send_html(render_dashboard_html(self.server.dashboard_name, self.server.dashboard_version))
+            self.send_dashboard()
             return
 
         if path == "/api/ports":
@@ -1295,6 +936,10 @@ class PortBrokerDashboardHandler(BaseHTTPRequestHandler):
             )
             return
 
+        if path == "/api/health":
+            self.send_json({"status": "healthy"})
+            return
+
         if path == "/favicon.ico":
             self.send_response(204)
             self.end_headers()
@@ -1302,6 +947,49 @@ class PortBrokerDashboardHandler(BaseHTTPRequestHandler):
 
         self.send_json({"error": f"No route for {path}"}, status=404)
 
+    def do_POST(self) -> None:
+        path = self.path.split("?", 1)[0]
+        match = re.fullmatch(r"/api/kill/(\d+)", path)
+        if not match:
+            self.send_json({"success": False, "message": "Not found."}, status=404)
+            return
+
+        pid = int(match.group(1))
+        with registry_lock():
+            try:
+                entries = load_entries(strict=True)
+                listener_map, listener_error = safe_listeners_by_key(entries)
+            except PortBrokerError as exc:
+                self.send_json({"success": False, "message": str(exc)}, status=500)
+                return
+        if listener_error:
+            self.send_json({"success": False, "message": listener_error}, status=500)
+            return
+
+        allowed_pids = {
+            listener.pid
+            for entry in entries.values()
+            for listener in listener_map.get((entry["proto"], entry["port"]), [])
+            if listener.pid is not None
+        }
+        if pid not in allowed_pids:
+            self.send_json(
+                {"success": False, "message": f"PID {pid} is not an active portbroker listener."},
+                status=403,
+            )
+            return
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            self.send_json({"success": False, "message": f"Process {pid} no longer exists."}, status=404)
+            return
+        except PermissionError:
+            self.send_json({"success": False, "message": f"Permission denied for PID {pid}."}, status=403)
+            return
+        except OSError as exc:
+            self.send_json({"success": False, "message": str(exc)}, status=500)
+            return
+        self.send_json({"success": True, "message": f"Sent SIGTERM to PID {pid}."})
 
 class PortBrokerDashboardServer(ThreadingHTTPServer):
     daemon_threads = True
@@ -1708,6 +1396,101 @@ def command_install_shell(args: argparse.Namespace) -> int:
     return 0
 
 
+def normalize_agent_name(name: str) -> str:
+    normalized = name.strip().lower().replace("_", "-")
+    aliases = {"claude": "claude-code", "claudecode": "claude-code", "open-code": "opencode"}
+    normalized = aliases.get(normalized, normalized)
+    if normalized not in SUPPORTED_AGENTS:
+        supported = ", ".join(sorted(SUPPORTED_AGENTS))
+        raise PortBrokerError(f"Unsupported agent '{name}'. Expected one of: {supported}.")
+    return normalized
+
+
+def detected_agents() -> list[str]:
+    candidates = {
+        "claude-code": Path.home() / ".claude",
+        "codex": Path.home() / ".codex",
+        "opencode": Path.home() / ".config" / "opencode",
+    }
+    return [name for name, config in candidates.items() if config.is_dir()]
+
+
+def skill_destination(agent: str) -> Path:
+    destinations = {
+        "claude-code": Path.home() / ".claude" / "skills" / "portbroker.md",
+        "codex": Path.home() / ".codex" / "AGENTS.md",
+        "opencode": Path.home() / ".config" / "opencode" / "AGENTS.md",
+    }
+    return destinations[agent]
+
+
+def skill_template_path(agent: str) -> Path:
+    filenames = {"claude-code": "claude-code.md", "codex": "codex.md", "opencode": "opencode.md"}
+    return skills_dir() / filenames[agent]
+
+
+def command_install_skill(args: argparse.Namespace) -> int:
+    if args.agents:
+        requested: list[str] = []
+        for item in args.agents.split(","):
+            agent = normalize_agent_name(item)
+            if agent not in requested:
+                requested.append(agent)
+        agents = requested
+    else:
+        agents = detected_agents()
+
+    if not agents:
+        print("No supported agent configuration directories detected.")
+        return 0
+
+    installed = 0
+    skipped = 0
+    planned = 0
+    for agent in agents:
+        source = skill_template_path(agent)
+        if not source.exists():
+            raise PortBrokerError(f"Skill template not found: {source}")
+        try:
+            skill_text = source.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise PortBrokerError(f"Cannot read skill template '{source}': {exc}") from exc
+        if SKILL_MARKER not in skill_text:
+            raise PortBrokerError(f"Skill template is missing marker: {source}")
+
+        destination = skill_destination(agent)
+        existing = ""
+        if destination.exists():
+            try:
+                existing = destination.read_text(encoding="utf-8")
+            except OSError as exc:
+                raise PortBrokerError(f"Cannot read agent instructions '{destination}': {exc}") from exc
+        if SKILL_MARKER in existing:
+            print(f"Already installed: {agent} -> {destination}")
+            skipped += 1
+            continue
+
+        if args.dry_run:
+            print(f"Would install: {agent} -> {destination}")
+            planned += 1
+            continue
+
+        ensure_parent(destination)
+        content = skill_text if not existing else existing.rstrip() + "\n\n" + skill_text
+        try:
+            destination.write_text(content.rstrip() + "\n", encoding="utf-8")
+        except OSError as exc:
+            raise PortBrokerError(f"Cannot install agent instructions '{destination}': {exc}") from exc
+        print(f"Installed: {agent} -> {destination}")
+        installed += 1
+
+    if args.dry_run:
+        print(f"Summary: {planned} to install, {skipped} already installed.")
+    else:
+        print(f"Summary: {installed} installed, {skipped} already installed.")
+    return 0
+
+
 def format_table(rows: list[dict[str, Any]], columns: list[tuple[str, str]]) -> str:
     if not rows:
         headers = [heading for _, heading in columns]
@@ -1977,6 +1760,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     install_shell_parser.add_argument("--json", action="store_true", help="Print JSON output.")
     install_shell_parser.set_defaults(func=command_install_shell)
+
+    install_skill_parser = subparsers.add_parser(
+        "install-skill",
+        help="Install portbroker instructions for supported coding agents.",
+    )
+    install_skill_parser.add_argument(
+        "--agents",
+        help="Comma-separated agents to install (claude-code,codex,opencode); default detects installed agents.",
+    )
+    install_skill_parser.add_argument("--dry-run", action="store_true", help="Show what would be installed.")
+    install_skill_parser.set_defaults(func=command_install_skill)
 
     web_parser = subparsers.add_parser(
         "web",

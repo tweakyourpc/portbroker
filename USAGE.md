@@ -1,227 +1,129 @@
-# portbroker
+# portbroker usage
 
-`portbroker` is a local CLI to allocate, claim, and track service ports for this homelab.
+`portbroker` is a standard-library Python CLI for named local port reservations, listener checks, and a live dashboard.
 
-- Language/runtime: Python 3, standard library only
 - Default registry: `~/.config/portbroker/ports.json`
-- Lock file: `~/.config/portbroker/ports.lock` (uses `fcntl` file locking)
-- Port checks: `ss -ltnp` (or `ss -lunp` for UDP), with `lsof -iTCP -sTCP:LISTEN` fallback when `ss` is unavailable
-- Persistence marker: entries can be marked `persistent` to protect them from auto-cleanup
+- Lock file: `~/.config/portbroker/ports.lock`
+- Listener checks: `ss`, with `lsof` fallback for TCP where available
+- Persistent reservations are retained until explicitly freed
 
 ## Install
 
-### Option A: system-wide (`/usr/local/bin`)
-
 ```bash
-sudo install -m 0755 ./portbroker /usr/local/bin/portbroker
-which portbroker
+curl -fsSL https://raw.githubusercontent.com/tweakyourpc/portbroker/main/install.sh | sh
 ```
 
-### Option B: user-local (`~/bin`)
+The installer places the CLI in `~/.local/bin`, installs the dashboard asset and skill templates under `~/.local/share/portbroker`, and runs `portbroker install-skill` for detected coding agents.
+
+For a checkout-based installation:
 
 ```bash
-mkdir -p "$HOME/bin"
-install -m 0755 ./portbroker "$HOME/bin/portbroker"
-export PATH="$HOME/bin:$PATH"
-which portbroker
+install -m 0755 ./portbroker "$HOME/.local/bin/portbroker"
+mkdir -p "$HOME/.local/share/portbroker/skills"
+install -m 0644 dashboard.html "$HOME/.local/share/portbroker/dashboard.html"
+install -m 0644 skills/*.md "$HOME/.local/share/portbroker/skills/"
 ```
 
-If your environment is restricted and cannot write `~/.config`, set one of:
+Set `PORTBROKER_CONFIG_DIR` or `PORTBROKER_REGISTRY` to relocate the local registry for tests or restricted environments.
+
+## Reservation commands
+
+### Allocate or reuse a name
 
 ```bash
-export PORTBROKER_CONFIG_DIR="$PWD/.portbroker-config"
-# or:
-export PORTBROKER_REGISTRY="$PWD/.portbroker-config/ports.json"
+PORT="$(portbroker alloc --name my-app --persistent)"
 ```
 
-## Commands
+`alloc` stores `name`, `port`, `host`, `proto`, timestamps, working directory, optional command and metadata, and persistence state. Existing names retain their assigned port.
 
-### Allocate
+Optional flags:
 
 ```bash
-portbroker alloc --name NAME [--range 8700-8999] [--host 0.0.0.0] [--proto tcp] [--persistent|-p] [--meta key=value ...] [--cmd "run command"]
+portbroker alloc --name api-server --range 8700-8999 --host 0.0.0.0 --proto tcp --persistent --meta group=backend --cmd "python3 -m http.server"
 ```
 
-- Picks a free port and stores:
-  - `name`, `port`, `host`, `proto`, `createdAt`, `updatedAt`, `cwd`, `cmd`, `meta`, `persistent`
-- `--persistent` marks the reservation so cleanup will not free it
-- Output: port number only (unless `--json`)
-- If a `persistent` reservation already exists for that name, returns the same port
-
-### Claim
+### Claim a chosen available port
 
 ```bash
-portbroker claim --name NAME --port PORT [--host 0.0.0.0] [--proto tcp] [--persistent|-p] [--meta key=value ...] [--cmd "run command"]
+portbroker claim --name dev-proxy --port "$PORT" --persistent
 ```
 
-- Reserves a specific free port
-- `--persistent` marks the reservation so cleanup will not free it
-- Output: port number only (unless `--json`)
-- To mark an existing reservation persistent:
-  - `portbroker claim --name NAME --port "$(portbroker get --name NAME)" --persistent`
-
-### Get
+### Read, list, or free reservations
 
 ```bash
-portbroker get --name NAME
-```
-
-- Prints port only
-- Exits nonzero if missing
-
-### Free
-
-```bash
-portbroker free --name NAME
-```
-
-### List
-
-```bash
+portbroker get --name my-app
 portbroker list
 portbroker list --json
+portbroker free --name my-app
 ```
 
-- Table columns: `name`, `port`, `host`, `proto`, `persistent`, `cwd`, `createdAt`, `lastSeenPid`
-
-### Cleanup
+### Clean and diagnose
 
 ```bash
-portbroker cleanup
 portbroker cleanup --dry-run
-portbroker cleanup --json
-```
-
-- Frees stale reservations that are not listening and not marked `persistent`
-- Never frees `persistent` entries
-- `persistent` entries are released only via explicit `portbroker free --name NAME`
-- `--dry-run` shows what would be freed without modifying the registry
-
-### Project Init (Node)
-
-```bash
-portbroker project-init --name NAME [--package-json package.json] [--start-cmd "node server.js"]
-```
-
-- Updates `scripts.start` in `package.json` to inject:
-  - `PORT=$(portbroker get --name NAME 2>/dev/null || portbroker alloc --name NAME --persistent)`
-- If `scripts.start` is missing, use `--start-cmd` to provide the underlying app command
-- Idempotent: if portbroker logic is already present, no rewrite is performed
-
-### Install Shell Helper
-
-```bash
-portbroker install-shell
-portbroker install-shell --shell bash
-portbroker install-shell --shell zsh
-```
-
-- Installs the `dev` helper by appending a `source` block into your shell rc file
-- Default helper path:
-  - `~/.config/portbroker/portbroker-shell.sh`
-- Auto-detects shell from `$SHELL`, or use `--shell bash|zsh`
-- For custom/testing targets, use `--rc-file PATH`
-
-### Web Dashboard
-
-```bash
-PORT=$(portbroker get --name portbroker-dashboard 2>/dev/null || portbroker alloc --name portbroker-dashboard --persistent)
-portbroker web --name portbroker-dashboard --port "$PORT" --persistent
-```
-
-- Runs a live dashboard on `0.0.0.0` by default
-- HTML dashboard: `/`
-- JSON feed: `/api/ports`
-- Homelab identity endpoint: `/whoami`
-- `--verbose` enables request logging
-- If `--port` is omitted, `web` reuses the named reservation or allocates from `--range`
-
-### Doctor
-
-```bash
+portbroker cleanup
 portbroker doctor
-portbroker doctor --json
+portbroker probe --port "$PORT"
 ```
 
-- Validates registry integrity
-- Flags duplicate/bad entries
-- Checks for active ports that appear owned by a different process (best effort with available process data)
-- Suggests recovery actions
+`cleanup` does not remove persistent reservations. `doctor` reports invalid entries and likely listener ownership drift without changing the registry.
 
-### Probe (optional)
+## Coding agent integration
 
 ```bash
-portbroker probe --port PORT [--proto tcp]
-portbroker probe --port PORT --json
+portbroker install-skill
+portbroker install-skill --agents claude-code,codex,opencode
+portbroker install-skill --agents codex --dry-run
 ```
 
-- Shows what is listening on the port
+When no `--agents` value is supplied, the command detects installed supported agents from their normal configuration directories. Installation is marker-based and idempotent.
 
-## Homelab usage pattern
+| Agent | Destination |
+| --- | --- |
+| Claude Code | `~/.claude/skills/portbroker.md` |
+| Codex | `~/.codex/AGENTS.md` |
+| OpenCode | `~/.config/opencode/AGENTS.md` |
 
-Use in scripts/commands without hardcoding ports:
+## Project helpers
 
-```bash
-PORT=$(portbroker alloc --name terminus-config)
-CONFIG_HOST=0.0.0.0 CONFIG_PORT=$PORT npm run config-server
-```
-
-For npm projects, initialize once so `npm start` handles port assignment automatically:
+For an npm application, inject named port setup into its start command:
 
 ```bash
 portbroker project-init --name my-app
-npm start
 ```
 
-Optional shell helper (`bash`/`zsh`) for manual projects:
+For an optional interactive shell helper:
 
 ```bash
 portbroker install-shell
-dev my-app
 ```
 
-- `dev my-app` runs `portbroker cleanup` silently in the background
-- Then it runs `portbroker alloc --name my-app --persistent`, exports `PORT`, and starts `npm start`
-- Override broker binary if needed: `export PORTBROKER_BIN=/usr/local/bin/portbroker`
+This installs a `dev my-app` convenience function that allocates a persistent named port, exports `PORT`, and runs `npm start`.
 
-For the dashboard itself:
+## Dashboard
 
 ```bash
-PORT=$(portbroker get --name portbroker-dashboard 2>/dev/null || portbroker alloc --name portbroker-dashboard --persistent)
-portbroker web --name portbroker-dashboard --port "$PORT" --persistent
+PORT="$(portbroker get --name portbroker-dashboard 2>/dev/null || portbroker alloc --name portbroker-dashboard --persistent)"
+portbroker web --host 0.0.0.0 --port "$PORT" --persistent
 ```
 
-## Quick smoke test
+The dashboard serves the bundled polished UI, correlates reservations with active listeners, and groups entries when `meta.group` is present. The kill control sends `SIGTERM` only when a requested PID is currently verified as a listener on a registered endpoint.
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `GET` | `/` | Dashboard UI |
+| `GET` | `/api/ports` | Reservation groups and live listener state |
+| `GET` | `/api/health` | Health status |
+| `GET` | `/whoami` | Service identity and bind details |
+| `POST` | `/api/kill/<pid>` | Guarded termination of a verified active listener |
+
+## Smoke test
 
 ```bash
-# allocate
-PORT=$(portbroker alloc --name smoke-portbroker --range 8900-8910 --host 0.0.0.0 --cmd "python3 -m http.server")
-echo "$PORT"
-# expected: a single integer in [8900, 8910]
-
-# get
-portbroker get --name smoke-portbroker
-# expected: same integer
-
-# list
+PORT="$(portbroker alloc --name test-app --persistent)"
+portbroker get --name test-app
 portbroker list
-# expected: one row containing name=smoke-portbroker and that port
-
-# cleanup preview
 portbroker cleanup --dry-run
-# expected: reports stale non-persistent entries only
-
-# probe (may show unknown process/pid if kernel permissions are restricted)
-portbroker probe --port "$PORT"
-
-# doctor
 portbroker doctor
-# expected: healthy or warning-level notes
-
-# free
-portbroker free --name smoke-portbroker
-
-# confirm missing (nonzero)
-portbroker get --name smoke-portbroker
-# expected: error + nonzero exit code
+portbroker free --name test-app
 ```
