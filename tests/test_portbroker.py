@@ -1,5 +1,6 @@
 import json
 import os
+import socket
 import subprocess
 import tempfile
 import unittest
@@ -90,6 +91,61 @@ class PortbrokerCLITest(unittest.TestCase):
             snapshot = json.loads(result.stdout)
             self.assertEqual([group["key"] for group in snapshot["groups"]], ["backend", "ungrouped"])
             self.assertEqual(len(snapshot["ports"]), 2)
+            self.assertEqual(snapshot["issues"], [])
+
+    def test_snapshot_skips_invalid_entries_and_reports_issues(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            registry = home / "config" / "ports.json"
+            registry.parent.mkdir(parents=True)
+            registry.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "entries": {
+                            "api-server": {"port": 28991, "host": "0.0.0.0", "proto": "tcp", "meta": "bad-meta"},
+                            "broken-api": {"port": "not-a-port", "host": "0.0.0.0", "proto": "tcp"},
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            env = self.env(home)
+            code = (
+                "import json,runpy; "
+                "m=runpy.run_path('portbroker'); "
+                "m['safe_listeners_by_key']=lambda entries: ({}, None); "
+                "print(json.dumps(m['build_dashboard_snapshot']('portbroker-dashboard','test')))"
+            )
+            result = subprocess.run(["python3", "-c", code], cwd=ROOT, env=env, text=True, capture_output=True, check=False)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            snapshot = json.loads(result.stdout)
+            self.assertEqual([port["name"] for port in snapshot["ports"]], ["api-server"])
+            self.assertEqual(snapshot["summary"]["total"], 1)
+            self.assertEqual({issue["name"] for issue in snapshot["issues"]}, {"api-server", "broken-api"})
+            self.assertTrue(any(issue["level"] == "error" for issue in snapshot["issues"]))
+            self.assertTrue(any(issue["level"] == "warning" for issue in snapshot["issues"]))
+
+    def test_alloc_existing_name_moves_from_unverified_listener(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            first = self.run_cli(home, "alloc", "--name", "test-app", "--range", "28970-28972")
+            self.assertEqual(first.returncode, 0, first.stderr)
+            original_port = int(first.stdout.strip())
+
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+                listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                listener.bind(("127.0.0.1", original_port))
+                listener.listen(1)
+
+                second = self.run_cli(home, "alloc", "--name", "test-app", "--range", "28970-28972")
+
+            self.assertEqual(second.returncode, 0, second.stderr)
+            replacement_port = int(second.stdout.strip())
+            self.assertNotEqual(replacement_port, original_port)
+
+            registry = json.loads((home / "config" / "ports.json").read_text(encoding="utf-8"))
+            self.assertEqual(registry["entries"]["test-app"]["port"], replacement_port)
 
 
 if __name__ == "__main__":

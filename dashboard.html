@@ -537,6 +537,13 @@ function renderServiceCard(item) {
   return card;
 }
 
+function issueText(issue) {
+  const level = issue?.level ? String(issue.level).toUpperCase() : 'ISSUE';
+  const name = issue?.name ? String(issue.name) : '-';
+  const message = issue?.message ? String(issue.message) : 'Registry validation issue.';
+  return `[${level}] ${name}: ${message}`;
+}
+
 function render() {
   const snapshot = state.snapshot;
   if (!snapshot) return;
@@ -550,8 +557,11 @@ function render() {
   const registry = snapshot.registryPath ? ` -- Registry ${snapshot.registryPath}` : '';
   checkedAtNode.textContent = `${checkedAt}${registry}`;
 
-  warningNode.classList.toggle('hidden', !snapshot.listenerError);
-  warningNode.textContent = snapshot.listenerError || '';
+  const warnings = [];
+  if (snapshot.listenerError) warnings.push(snapshot.listenerError);
+  for (const issue of (snapshot.issues || [])) warnings.push(issueText(issue));
+  warningNode.classList.toggle('hidden', warnings.length === 0);
+  warningNode.textContent = warnings.join('\n');
 
   groupsNode.textContent = '';
   let shownGroups = 0;

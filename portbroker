@@ -510,6 +510,11 @@ def load_entries(strict: bool = True) -> dict[str, dict[str, Any]]:
     return normalized
 
 
+def load_entries_with_issues() -> tuple[dict[str, dict[str, Any]], list[dict[str, str]]]:
+    raw = load_registry_raw()
+    return normalize_entries(raw.get("entries", {}))
+
+
 def emit_port(name: str, port: int, as_json: bool) -> None:
     if as_json:
         print(json.dumps({"name": name, "port": port}, sort_keys=True))
@@ -625,7 +630,7 @@ def safe_listeners_by_key(entries: dict[str, dict[str, Any]]) -> tuple[dict[tupl
 
 def build_dashboard_snapshot(service_name: str, version: str) -> dict[str, Any]:
     with registry_lock():
-        entries = load_entries(strict=True)
+        entries, issues = load_entries_with_issues()
         listener_map, listener_error = safe_listeners_by_key(entries)
 
     rows: list[dict[str, Any]] = []
@@ -704,6 +709,7 @@ def build_dashboard_snapshot(service_name: str, version: str) -> dict[str, Any]:
         "checkedAt": now_iso(),
         "registryPath": str(registry_path()),
         "listenerError": listener_error,
+        "issues": issues,
         "summary": {
             "total": len(rows),
             "active": active_count,
@@ -1039,6 +1045,15 @@ def command_alloc(args: argparse.Namespace) -> int:
                     f"'{name}' already exists with proto '{entry['proto']}'. "
                     f"Free it first or re-claim with the same proto."
                 )
+
+            current_port = entry["port"]
+            listeners = [listener for listener in listeners_for_proto(proto) if listener.port == current_port]
+            if listeners:
+                whoami = fetch_dashboard_whoami(entry.get("host", host), current_port) if proto == "tcp" else None
+                if not (whoami and whoami.get("service") == name):
+                    current_port = find_free_port(entries, proto, (start, end), exclude_names={name})
+
+            entry["port"] = current_port
             entry["host"] = host
             entry["cwd"] = os.getcwd()
             entry["updatedAt"] = now
@@ -1051,28 +1066,22 @@ def command_alloc(args: argparse.Namespace) -> int:
             emit_port(name, entry["port"], args.json)
             return 0
 
-        reserved = {entry["port"] for entry in entries.values() if entry["proto"] == proto}
-        listening = {listener.port for listener in listeners_for_proto(proto)}
-        for candidate in range(start, end + 1):
-            if candidate in reserved or candidate in listening:
-                continue
-            entries[name] = {
-                "name": name,
-                "port": candidate,
-                "host": host,
-                "proto": proto,
-                "createdAt": now,
-                "updatedAt": now,
-                "cwd": os.getcwd(),
-                "cmd": args.cmd or "",
-                "meta": meta,
-                "persistent": persistent_requested,
-            }
-            save_registry(entries)
-            emit_port(name, candidate, args.json)
-            return 0
-
-    raise PortBrokerError(f"No free {proto.upper()} ports found in range {start}-{end}.")
+        candidate = find_free_port(entries, proto, (start, end))
+        entries[name] = {
+            "name": name,
+            "port": candidate,
+            "host": host,
+            "proto": proto,
+            "createdAt": now,
+            "updatedAt": now,
+            "cwd": os.getcwd(),
+            "cmd": args.cmd or "",
+            "meta": meta,
+            "persistent": persistent_requested,
+        }
+        save_registry(entries)
+        emit_port(name, candidate, args.json)
+        return 0
 
 
 def command_claim(args: argparse.Namespace) -> int:
