@@ -1,12 +1,27 @@
 # portbroker
 
-Named port registry plus live dashboard for concurrent local development sessions.
-
-![portbroker routing named reservations without port collisions](docs/hero.png)
-
 ## Why this exists
 
-Multiple local services and coding agents frequently try to bind the same familiar ports. `portbroker` gives each service a stable named reservation, so sessions can start reliably without hardcoded port collisions.
+You already have a dev server on `:3000`.
+An AI coding agent starts another app, reaches for the same port, and one process wins.
+Now the browser tab you trusted is pointed at the wrong server, or the agent silently stole the port your work depended on.
+`portbroker` gives local services stable named reservations before anything binds.
+
+<!--
+Record demo with:
+asciinema rec docs/demo.cast
+
+Rough script:
+terminal A: start a server on :3000
+terminal B: agent tries to start its own server, collides
+install portbroker
+terminal B succeeds on a different port
+
+Target length: ~20-30s
+-->
+<!-- [![asciicast](https://asciinema.org/a/PORTBROKER_DEMO.svg)](https://asciinema.org/a/PORTBROKER_DEMO) -->
+
+![portbroker routing named reservations without port collisions](docs/hero.png)
 
 ## Install
 
@@ -41,7 +56,13 @@ portbroker install-skill
 portbroker install-skill --agents codex,opencode --dry-run
 ```
 
-## CLI commands
+## Has this happened to you?
+
+Native support requests are open for [Anthropic Claude Code](https://github.com/anthropics/claude-code/issues/34385) and [OpenAI Codex](https://github.com/openai/codex/issues/16483).
+
+If this has happened to you, comment on the issue with the agent name, what you were running, and what got hijacked. Vendor triage moves on concrete user incidents, not thumbs-ups.
+
+## CLI/API reference
 
 | Command | Purpose |
 | --- | --- |
@@ -60,16 +81,6 @@ portbroker install-skill --agents codex,opencode --dry-run
 
 See [USAGE.md](USAGE.md) for detailed command options and workflows.
 
-## Dashboard
-
-![portbroker dashboard showing generic service reservations](docs/dashboard.png)
-
-The bundled dashboard is the merged successor to `portbroker-dashboard`. It groups services using optional `meta.group` values, reports listener status, and supports termination of an active process from the UI.
-
-The kill action is guarded: the server sends `SIGTERM` only to a PID currently verified as listening on an endpoint present in the portbroker registry. It does not send `SIGKILL`.
-
-## API endpoints
-
 | Method | Path | Purpose |
 | --- | --- | --- |
 | `GET` | `/` | Serve the dashboard UI |
@@ -78,9 +89,17 @@ The kill action is guarded: the server sends `SIGTERM` only to a PID currently v
 | `GET` | `/whoami` | Return service identity and bind details |
 | `POST` | `/api/kill/<pid>` | Send guarded `SIGTERM` to a verified active listener |
 
+## Dashboard
+
+![portbroker dashboard showing generic service reservations](docs/dashboard.png)
+
+The bundled dashboard is the merged successor to `portbroker-dashboard`. It groups services using optional `meta.group` values, reports listener status, and supports termination of an active process from the UI.
+
+The kill action is guarded: the server sends `SIGTERM` only to a PID currently verified as listening on an endpoint present in the portbroker registry. It does not send `SIGKILL`.
+
 ## Native platform support
 
-Native support requests have been filed with [Anthropic Claude Code](https://github.com/anthropics/claude-code/issues/34385) and [OpenAI Codex](https://github.com/openai/codex/issues/16483).
+Native agent support is still the right fix. `portbroker` is the local workaround until coding agents expose a first-class port reservation API.
 
 ## License
 

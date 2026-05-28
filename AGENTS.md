@@ -1,5 +1,7 @@
 # Portbroker Agent Skill Guide
 
+AI coding agents and local dev servers can silently collide on familiar ports; reserve a named port before anything binds.
+
 Use this repository as a Codex/CLI agent skill so every server launch goes through named port allocation.
 
 ## Skill intent
