@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+echo "[portbroker] running repo quality gate"
+python3 -m py_compile portbroker
+bash -n scripts/portbroker-shell.sh
+python3 portbroker --help >/dev/null
