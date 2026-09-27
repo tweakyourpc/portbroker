@@ -133,10 +133,27 @@ details.group summary::-webkit-details-marker { display: none; }
 .pill.neutral { background: var(--chip-bg); color: var(--chip-text); }
 .service-detail-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px; }
 .detail { border: 1px solid var(--line); border-radius: 12px; padding: 10px 12px; background: rgba(255,255,255,0.02); }
+.detail.wide { grid-column: 1 / -1; }
 :root[data-theme='light'] .detail { background: rgba(15, 118, 110, 0.03); }
 .detail span { display: block; font-size: 11px; font-weight: 800; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); margin-bottom: 6px; }
 .detail strong, .detail code { font-size: 0.95rem; color: var(--text); }
 .detail code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; word-break: break-word; }
+.detail-value-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.detail-value-row code { flex: 1; min-width: 0; }
+.copy-btn {
+  flex: 0 0 auto;
+  border: 1px solid var(--line-strong);
+  border-radius: 10px;
+  padding: 6px 10px;
+  background: var(--chip-bg);
+  color: var(--chip-text);
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+}
+.copy-btn:hover { border-color: var(--accent); color: var(--accent); }
+.copy-btn:focus-visible { outline: none; box-shadow: var(--focus); }
 .kill-btn {
   border: 1px solid rgba(251, 113, 133, 0.35);
   border-radius: 10px;
@@ -273,7 +290,7 @@ details.group summary::-webkit-details-marker { display: none; }
   </section>
 
   <footer class="footer">
-    <span>v1.1.0</span>
+    <span id="appVersion">v-</span>
     <span><code>/api/ports</code></span>
     <span><code>/whoami</code></span>
   </footer>
@@ -356,6 +373,19 @@ function showToast(message, type) {
   setTimeout(() => killToast.classList.add('hidden'), 3000);
 }
 
+function shellQuote(value) {
+  return `'${String(value).replace(/'/g, `'\\''`)}'`;
+}
+
+async function copyText(value, label) {
+  try {
+    await navigator.clipboard.writeText(value);
+    showToast(`Copied ${label}`, 'success');
+  } catch (error) {
+    showToast(`Copy failed: ${error.message}`, 'error');
+  }
+}
+
 async function killPid(pid, name, btn) {
   btn.disabled = true;
   try {
@@ -418,16 +448,27 @@ function populateGroupFilter(snapshot) {
   }
 }
 
-function detailCard(label, value, mono=false) {
+function detailCard(label, value, mono=false, options={}) {
   const node = document.createElement('div');
-  node.className = 'detail';
+  node.className = options.wide ? 'detail wide' : 'detail';
   const span = document.createElement('span');
   span.textContent = label;
   node.appendChild(span);
   if (mono) {
+    const valueRow = document.createElement('div');
+    valueRow.className = 'detail-value-row';
     const code = document.createElement('code');
     code.textContent = value;
-    node.appendChild(code);
+    valueRow.appendChild(code);
+    if (options.copyText) {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'copy-btn';
+      button.textContent = options.copyLabel || 'Copy';
+      button.addEventListener('click', () => copyText(options.copyText, options.copyLabel || label));
+      valueRow.appendChild(button);
+    }
+    node.appendChild(valueRow);
   } else {
     const strong = document.createElement('strong');
     strong.textContent = value;
@@ -529,8 +570,16 @@ function renderServiceCard(item) {
   grid.appendChild(detailCard('Protocol', String(item.proto || '').toUpperCase() || '-', true));
   grid.appendChild(detailCard('Listeners', Array.isArray(item.listeners) && item.listeners.length ? item.listeners.join(', ') : 'idle', true));
   grid.appendChild(detailCard('Updated', item.updatedAt || item.createdAt || '-', true));
+  if (item.cwd) {
+    grid.appendChild(detailCard('Working directory', item.cwd, true, {
+      wide: true,
+      copyText: `cd ${shellQuote(item.cwd)}`,
+      copyLabel: 'Copy cd',
+    }));
+  } else {
+    grid.appendChild(detailCard('Working directory', '-', true, { wide: true }));
+  }
   if (state.mode === 'insight') {
-    grid.appendChild(detailCard('Working directory', item.cwd || '-', true));
     grid.appendChild(detailCard('Command', item.cmd || '-', true));
   }
   card.appendChild(grid);
@@ -552,6 +601,7 @@ function render() {
   setText('activeCount', snapshot.summary?.active ?? 0);
   setText('reservedCount', (snapshot.summary?.reserved ?? 0) + (snapshot.summary?.retired ?? 0));
   setText('persistentCount', snapshot.summary?.persistent ?? 0);
+  setText('appVersion', `v${snapshot.version || '-'}`);
 
   const checkedAt = snapshot.checkedAt ? `Last checked ${snapshot.checkedAt}` : 'Waiting for first refresh...';
   const registry = snapshot.registryPath ? ` -- Registry ${snapshot.registryPath}` : '';

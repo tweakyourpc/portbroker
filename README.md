@@ -69,6 +69,7 @@ If this has happened to you, comment on the issue with the agent name, what you 
 | `portbroker alloc --name api-server --persistent` | Allocate or reuse a named reservation |
 | `portbroker claim --name dev-proxy --port PORT` | Reserve an explicit available port |
 | `portbroker get --name my-app` | Print an existing reserved port |
+| `portbroker cwd --name my-app` | Print the recorded working directory |
 | `portbroker list` | Show reservations and listeners |
 | `portbroker free --name my-app` | Remove a reservation |
 | `portbroker cleanup` | Remove stale non-persistent reservations |
@@ -93,7 +94,9 @@ See [USAGE.md](USAGE.md) for detailed command options and workflows.
 
 ![portbroker dashboard showing generic service reservations](docs/dashboard.png)
 
-The bundled dashboard is the merged successor to `portbroker-dashboard`. It groups services using optional `meta.group` values, reports listener status, and supports termination of an active process from the UI.
+The bundled dashboard is the merged successor to `portbroker-dashboard`. It groups services using optional `meta.group` values, reports listener status, shows each reservation's recorded working directory, and supports termination of an active process from the UI.
+
+Service cards include a copyable `cd` command when a working directory is recorded.
 
 The kill action is guarded: the server sends `SIGTERM` only to a PID currently verified as listening on an endpoint present in the portbroker registry. It does not send `SIGKILL`.
 

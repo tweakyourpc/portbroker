@@ -62,6 +62,39 @@ class PortbrokerCLITest(unittest.TestCase):
             self.assertEqual(get.returncode, 0, get.stderr)
             self.assertEqual(get.stdout.strip(), alloc.stdout.strip())
 
+    def test_cwd_returns_recorded_working_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            alloc = self.run_cli(home, "alloc", "--name", "test-app", "--range", "28970-28990")
+            self.assertEqual(alloc.returncode, 0, alloc.stderr)
+            cwd = self.run_cli(home, "cwd", "--name", "test-app")
+            self.assertEqual(cwd.returncode, 0, cwd.stderr)
+            self.assertEqual(cwd.stdout.strip(), str(ROOT))
+
+            cwd_json = self.run_cli(home, "cwd", "--name", "test-app", "--json")
+            self.assertEqual(cwd_json.returncode, 0, cwd_json.stderr)
+            self.assertEqual(json.loads(cwd_json.stdout), {"name": "test-app", "cwd": str(ROOT)})
+
+    def test_cwd_errors_when_working_directory_is_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            registry = home / "config" / "ports.json"
+            registry.parent.mkdir(parents=True)
+            registry.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "entries": {
+                            "missing-cwd": {"port": 28991, "host": "0.0.0.0", "proto": "tcp", "cwd": ""}
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            cwd = self.run_cli(home, "cwd", "--name", "missing-cwd")
+            self.assertEqual(cwd.returncode, 1)
+            self.assertIn("has no working directory recorded", cwd.stderr)
+
     def test_grouped_snapshot_contract(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp)

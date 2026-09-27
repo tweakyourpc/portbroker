@@ -6,3 +6,4 @@ ports.json
 config/
 .venv/
 venv/
+.codex/writeback-staging/

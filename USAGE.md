@@ -52,6 +52,8 @@ portbroker claim --name dev-proxy --port "$PORT" --persistent
 
 ```bash
 portbroker get --name my-app
+portbroker cwd --name my-app
+cd "$(portbroker cwd --name my-app)"
 portbroker list
 portbroker list --json
 portbroker free --name my-app
@@ -107,7 +109,7 @@ PORT="$(portbroker get --name portbroker-dashboard 2>/dev/null || portbroker all
 portbroker web --host 0.0.0.0 --port "$PORT" --persistent
 ```
 
-The dashboard serves the bundled polished UI, correlates reservations with active listeners, and groups entries when `meta.group` is present. The kill control sends `SIGTERM` only when a requested PID is currently verified as a listener on a registered endpoint.
+The dashboard serves the bundled polished UI, correlates reservations with active listeners, shows recorded working directories with copyable `cd` commands, and groups entries when `meta.group` is present. The kill control sends `SIGTERM` only when a requested PID is currently verified as a listener on a registered endpoint.
 
 | Method | Path | Purpose |
 | --- | --- | --- |
