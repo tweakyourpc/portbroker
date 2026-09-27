@@ -379,7 +379,20 @@ function shellQuote(value) {
 
 async function copyText(value, label) {
   try {
-    await navigator.clipboard.writeText(value);
+    if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+      await navigator.clipboard.writeText(value);
+    } else {
+      const textarea = document.createElement('textarea');
+      textarea.value = value;
+      textarea.setAttribute('readonly', '');
+      textarea.style.position = 'fixed';
+      textarea.style.left = '-9999px';
+      document.body.appendChild(textarea);
+      textarea.select();
+      const copied = document.execCommand('copy');
+      textarea.remove();
+      if (!copied) throw new Error('clipboard API is unavailable');
+    }
     showToast(`Copied ${label}`, 'success');
   } catch (error) {
     showToast(`Copy failed: ${error.message}`, 'error');
